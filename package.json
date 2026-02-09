@@ -1,0 +1,32 @@
+{
+  "name": "vibeide",
+  "version": "0.1.0",
+  "description": "Claude Code from your phone. Telegram bot that bridges to the full Claude Agent SDK.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "claude",
+    "telegram",
+    "claude-code",
+    "ai-agent",
+    "claude-agent-sdk",
+    "developer-tools"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "tsx app/src/index.ts",
+    "dev": "tsx watch app/src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest",
+    "grammy": "^1.39.3",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0"
+  }
+}
