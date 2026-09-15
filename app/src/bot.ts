@@ -1,5 +1,8 @@
-import { Bot, InlineKeyboard, type Context } from "grammy";
+import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 import type { Message } from "grammy/types";
+import { mkdir, stat, unlink, writeFile } from "fs/promises";
+import { isAbsolute, join } from "path";
+import { tmpdir } from "os";
 import type { Config } from "./config.js";
 import { Bridge } from "./bridge.js";
 import {
@@ -9,6 +12,7 @@ import {
   type ThreadRoute,
 } from "./topics.js";
 import {
+  baseName,
   listProjects,
   listSessions,
   getSessionTitle,
@@ -17,6 +21,13 @@ import {
   formatRelativeTime,
   type ProjectInfo,
 } from "./projects.js";
+
+// Directory where files sent to the bot are saved for the agent to read.
+const INBOX_DIR = join(process.cwd(), "inbox");
+
+function sanitizeFileName(name: string): string {
+  return name.replace(/[\\/:*?"<>|]/g, "_").slice(0, 120) || "file";
+}
 
 // Telegram inline-button labels are short; keep names readable.
 function shorten(s: string, max = 40): string {
@@ -36,14 +47,43 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   const bot = new Bot(config.telegramBotToken);
   const bridge = new Bridge(bot.api, initialProjectPath);
 
-  // Reply into the topic the update came from.
+  // Reply into the topic the update came from. A Markdown parse failure
+  // falls back to plain text — losing the reply is worse than losing bold.
   async function replyRouted(
     ctx: Context,
     text: string,
     extra?: Parameters<Context["reply"]>[1]
   ): Promise<void> {
-    await sendRouted(bot.api, ctx.chat!.id, text, routeOf(ctx), extra);
+    const route = routeOf(ctx);
+    try {
+      await sendRouted(bot.api, ctx.chat!.id, text, route, extra);
+    } catch (err) {
+      if (!extra || !("parse_mode" in extra)) throw err;
+      const { parse_mode: _unused, ...rest } = extra as Record<string, unknown>;
+      await sendRouted(bot.api, ctx.chat!.id, text, route, rest);
+    }
   }
+
+  // A crashed handler should tell the user, not die silently in bot.out.
+  bot.catch(async (err) => {
+    console.error("Handler error:", err.error);
+    try {
+      const ctx = err.ctx;
+      if (ctx.chat) {
+        const reason = String((err.error as any)?.message ?? err.error).slice(0, 200);
+        await sendRouted(
+          bot.api,
+          ctx.chat.id,
+          `⚠️ Ошибка обработчика: ${reason}`,
+          extractRoute(
+            ctx.message ?? (ctx.callbackQuery?.message as Message | undefined)
+          )
+        );
+      }
+    } catch {
+      // reporting must never crash the bot
+    }
+  });
 
   // In topics mode messages never arrive in the plain chat view, so binding
   // the latest-by-mtime session to "main" would only feed stale bindings to
@@ -62,9 +102,12 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     }
   }
 
-  // Auth middleware — silently drop unauthorized users
+  // Auth middleware — drop unauthorized users (with a trace in the log)
   bot.use(async (ctx, next) => {
-    if (ctx.from?.id !== config.allowedUserId) return;
+    if (ctx.from?.id !== config.allowedUserId) {
+      console.log(`[auth] dropped update from user ${ctx.from?.id ?? "?"}`);
+      return;
+    }
     await next();
   });
 
@@ -107,10 +150,12 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         "",
         "*Команды* (действуют на вкладку, где написаны):",
         "/status — проект, вкладка и сессия",
-        "/sessions — выбрать сессию для этой вкладки",
+        "/stop — прервать текущую задачу и очистить очередь",
+        "/sessions — выбрать сессию (листается кнопками Ещё/Назад)",
         "/resume <id> — привязать сессию по id (хватит первых 8 символов)",
-        "/history [n] — последние n реплик сессии (по умолчанию 10)",
+        "/history [n] — последние n реплик сессии; /history all — вся история файлом",
         "/rename <имя> — переименовать сессию (и вкладку); имя видно и в терминале",
+        "/get <путь> — прислать файл из проекта в чат",
         "/new — отвязать сессию: следующее сообщение начнёт свежую",
         "/projects — список проектов",
         "/switch — сменить проект этой вкладки",
@@ -121,7 +166,9 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         "📌 — уже открыта в другой вкладке; при выборе бот предложит «Take over here» — забрать сюда",
         "🟢 — пишется прямо сейчас (например, открыта в терминале — лучше не трогать)",
         "",
-        "Фото можно отправлять с подписью — бот увидит картинку.",
+        "Пока бот занят, новые сообщения встают в очередь (до 5).",
+        "Во время работы бот показывает «печатает…» и текущий инструмент (⚙️).",
+        "Фото и файлы можно отправлять с подписью: фото бот видит, файл сохраняет и передаёт агенту путь.",
       ].join("\n"),
       { parse_mode: "Markdown" }
     );
@@ -141,6 +188,17 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       ctx,
       `Project: \`${state.projectPath}\`\nTopic: \`${routeKey(routeOf(ctx))}\`\nSession: ${sessionInfo}`,
       { parse_mode: "Markdown" }
+    );
+  });
+
+  // /stop — interrupt the running query of this topic and clear its queue
+  bot.command("stop", async (ctx) => {
+    const result = await bridge.stop(routeKey(routeOf(ctx)));
+    await replyRouted(
+      ctx,
+      result === "stopped"
+        ? "⏹ Останавливаю. Очередь очищена."
+        : "Сейчас ничего не выполняется."
     );
   });
 
@@ -194,7 +252,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     const key = routeKey(routeOf(ctx));
     bridge.store.setProject(key, projectPath);
     const resumedId = await bridge.resumeLatest(key);
-    const name = projectPath.split("/").filter(Boolean).pop() || projectPath;
+    const name = baseName(projectPath);
     await ctx.answerCallbackQuery();
     const sessionNote = resumedId
       ? `Resumed session \`${resumedId.slice(0, 8)}...\``
@@ -204,22 +262,23 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     });
   });
 
-  // /sessions command — list recent sessions of the current topic's project
-  bot.command("sessions", async (ctx) => {
-    const key = routeKey(routeOf(ctx));
+  const SESSIONS_PAGE = 10;
+
+  // One page of the session picker for a topic; undefined when no sessions.
+  async function sessionsView(
+    key: string,
+    offset: number
+  ): Promise<{ text: string; keyboard: InlineKeyboard } | undefined> {
     const state = bridge.threadState(key);
     const sessions = await listSessions(state.projectPath);
-    if (sessions.length === 0) {
-      await replyRouted(
-        ctx,
-        `No sessions found for \`${state.projectPath}\``,
-        { parse_mode: "Markdown" }
-      );
-      return;
-    }
+    if (sessions.length === 0) return undefined;
+    const safeOffset = Math.max(
+      0,
+      Math.min(offset, Math.max(0, sessions.length - 1))
+    );
 
     const keyboard = new InlineKeyboard();
-    for (const s of sessions.slice(0, 10)) {
+    for (const s of sessions.slice(safeOffset, safeOffset + SESSIONS_PAGE)) {
       // ● bound to this topic, 📌 already open in another topic
       const mark =
         s.id === state.sessionId
@@ -238,10 +297,45 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         )
         .row();
     }
+    if (safeOffset > 0) {
+      keyboard.text("◂ Назад", `sessions:${Math.max(0, safeOffset - SESSIONS_PAGE)}`);
+    }
+    if (sessions.length > safeOffset + SESSIONS_PAGE) {
+      keyboard.text("Ещё ▸", `sessions:${safeOffset + SESSIONS_PAGE}`);
+    }
 
-    await replyRouted(ctx, "Pick a session to resume:", {
-      reply_markup: keyboard,
-    });
+    const text =
+      sessions.length > SESSIONS_PAGE
+        ? `Pick a session (${safeOffset + 1}–${Math.min(safeOffset + SESSIONS_PAGE, sessions.length)} of ${sessions.length}):`
+        : "Pick a session to resume:";
+    return { text, keyboard };
+  }
+
+  // /sessions command — paged list of the current topic's project sessions
+  bot.command("sessions", async (ctx) => {
+    const key = routeKey(routeOf(ctx));
+    const view = await sessionsView(key, 0);
+    if (!view) {
+      const state = bridge.threadState(key);
+      await replyRouted(
+        ctx,
+        `No sessions found for \`${state.projectPath}\``,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+    await replyRouted(ctx, view.text, { reply_markup: view.keyboard });
+  });
+
+  // Pagination of the session picker (Ещё / Назад)
+  bot.callbackQuery(/^sessions:/, async (ctx) => {
+    const offset =
+      parseInt(ctx.callbackQuery.data.slice("sessions:".length), 10) || 0;
+    const view = await sessionsView(routeKey(routeOf(ctx)), offset);
+    await ctx.answerCallbackQuery();
+    if (view) {
+      await ctx.editMessageText(view.text, { reply_markup: view.keyboard });
+    }
   });
 
   // Display name of the topic already holding a session, for conflict notes.
@@ -361,7 +455,27 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     await bridge.syncTopicTitle(ctx.chat.id, routeOf(ctx));
   });
 
-  // /history [n] — last n text messages of the current topic's session
+  // Send a document into the topic; on routing failure send it plain.
+  async function sendDocumentRouted(
+    ctx: Context,
+    file: InputFile,
+    caption?: string
+  ): Promise<void> {
+    const route = routeOf(ctx);
+    try {
+      await bot.api.sendDocument(ctx.chat!.id, file, {
+        caption,
+        ...(route.messageThreadId !== undefined
+          ? { message_thread_id: route.messageThreadId }
+          : {}),
+      });
+    } catch {
+      await bot.api.sendDocument(ctx.chat!.id, file, { caption });
+    }
+  }
+
+  // /history [n|all] — last n text messages of the current topic's session,
+  // or the whole conversation as a text file
   bot.command("history", async (ctx) => {
     const state = bridge.threadState(routeKey(routeOf(ctx)));
     if (!state.sessionId) {
@@ -372,7 +486,37 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       return;
     }
 
-    let limit = parseInt((ctx.match || "").trim(), 10);
+    const arg = (ctx.match || "").trim().toLowerCase();
+    if (arg === "all") {
+      const messages = await readSessionMessages(
+        state.projectPath,
+        state.sessionId,
+        Number.MAX_SAFE_INTEGER
+      );
+      if (messages.length === 0) {
+        await replyRouted(ctx, "Session log is empty or not found on disk.");
+        return;
+      }
+      const title = await getSessionTitle(state.projectPath, state.sessionId);
+      const body = messages
+        .map((m) => `${m.role === "user" ? "👤 USER" : "🤖 CLAUDE"}\n${m.text}`)
+        .join("\n\n" + "-".repeat(40) + "\n\n");
+      const fileBase = sanitizeFileName(title || state.sessionId.slice(0, 8));
+      const tmpFile = join(tmpdir(), `vibeide-${Date.now()}.txt`);
+      await writeFile(tmpFile, `${title ?? state.sessionId}\n\n${body}`, "utf-8");
+      try {
+        await sendDocumentRouted(
+          ctx,
+          new InputFile(tmpFile, `${fileBase}.txt`),
+          `История: ${messages.length} сообщений`
+        );
+      } finally {
+        await unlink(tmpFile).catch(() => {});
+      }
+      return;
+    }
+
+    let limit = parseInt(arg, 10);
     if (!Number.isFinite(limit) || limit <= 0) limit = 10;
     limit = Math.min(limit, 50);
 
@@ -448,6 +592,72 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     await replyRouted(ctx, `Renamed to «${name}».`);
   });
 
+  // /get <path> — send a file from the project (or an absolute path) to chat
+  bot.command("get", async (ctx) => {
+    const arg = (ctx.match || "").trim().replace(/^["']|["']$/g, "");
+    if (!arg) {
+      await replyRouted(
+        ctx,
+        "Usage: `/get <путь>` — файл из проекта (относительный) или абсолютный путь.",
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    const state = bridge.threadState(routeKey(routeOf(ctx)));
+    const filePath = isAbsolute(arg) ? arg : join(state.projectPath, arg);
+    const info = await stat(filePath).catch(() => null);
+    if (!info || !info.isFile()) {
+      await replyRouted(ctx, `Файл не найден: ${filePath}`);
+      return;
+    }
+    if (info.size > 50 * 1024 * 1024) {
+      await replyRouted(
+        ctx,
+        `Файл больше 50 МБ (${Math.round(info.size / 1024 / 1024)} МБ) — Telegram не пропустит.`
+      );
+      return;
+    }
+    await sendDocumentRouted(ctx, new InputFile(filePath));
+  });
+
+  // Handle documents — save into the inbox and hand the path to the agent
+  bot.on("message:document", async (ctx) => {
+    const doc = ctx.message.document;
+    let file;
+    try {
+      file = await ctx.api.getFile(doc.file_id);
+    } catch {
+      // Bot API refuses files above 20 MB
+      await replyRouted(
+        ctx,
+        "Не могу скачать: Telegram отдаёт ботам файлы только до 20 МБ."
+      );
+      return;
+    }
+    if (!file.file_path) {
+      await replyRouted(ctx, "Could not download file.");
+      return;
+    }
+
+    const url = `https://api.telegram.org/file/bot${config.telegramBotToken}/${file.file_path}`;
+    const response = await fetch(url);
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    await mkdir(INBOX_DIR, { recursive: true });
+    const name = sanitizeFileName(doc.file_name || "file.bin");
+    const savedPath = join(INBOX_DIR, `${Date.now()}-${name}`);
+    await writeFile(savedPath, buffer);
+
+    const caption = ctx.message.caption;
+    const note = `[Файл от пользователя сохранён: ${savedPath}]`;
+    const prompt = caption
+      ? `${caption}\n\n${note}`
+      : `${note} Посмотри этот файл.`;
+    await bridge.sendMessage(ctx.chat.id, prompt, extractRoute(ctx.message));
+    await bridge.syncTopicTitle(ctx.chat.id, extractRoute(ctx.message));
+  });
+
   // Handle photo messages (images)
   bot.on("message:photo", async (ctx) => {
     const photo = ctx.message.photo;
@@ -496,10 +706,12 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   // Command menu with autocomplete — also guards against typos like /session
   await bot.api.setMyCommands([
     { command: "status", description: "Проект и сессия этой вкладки" },
+    { command: "stop", description: "Прервать текущую задачу" },
     { command: "sessions", description: "Выбрать сессию для этой вкладки" },
     { command: "resume", description: "Привязать сессию по id" },
-    { command: "history", description: "Последние сообщения сессии" },
+    { command: "history", description: "Последние сообщения сессии (all — файлом)" },
     { command: "rename", description: "Переименовать сессию и вкладку" },
+    { command: "get", description: "Прислать файл из проекта" },
     { command: "new", description: "Свежая сессия в этой вкладке" },
     { command: "projects", description: "Список проектов" },
     { command: "switch", description: "Сменить проект вкладки" },

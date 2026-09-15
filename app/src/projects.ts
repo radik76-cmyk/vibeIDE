@@ -23,7 +23,7 @@ function encodePath(projectPath: string): string {
 }
 
 // Last path segment of a Windows or POSIX path, for display.
-function baseName(p: string): string {
+export function baseName(p: string): string {
   return p.split(/[\\/]/).filter(Boolean).pop() || p;
 }
 

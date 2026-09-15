@@ -9,10 +9,40 @@ import {
   type ThreadRoute,
 } from "./topics.js";
 
+interface PendingMessage {
+  chatId: number;
+  text: string;
+  route: ThreadRoute;
+  images?: { data: string; mediaType: string }[];
+}
+
+const QUEUE_LIMIT = 5;
+
+// Compact one-line description of a tool call for the activity notice.
+function toolLine(name: string, input: unknown): string {
+  const i = input as Record<string, unknown> | undefined;
+  const detail =
+    typeof i?.command === "string"
+      ? i.command
+      : typeof i?.file_path === "string"
+        ? i.file_path
+        : typeof i?.pattern === "string"
+          ? i.pattern
+          : typeof i?.prompt === "string"
+            ? i.prompt
+            : typeof i?.url === "string"
+              ? i.url
+              : "";
+  const d = String(detail).replace(/\s+/g, " ").slice(0, 60);
+  return d ? `${name}: ${d}` : name;
+}
+
 export class Bridge {
   store: ThreadStore;
-  private busy = new Set<string>();
   private api: Api<RawApi>;
+  private busy = new Set<string>();
+  private queues = new Map<string, PendingMessage[]>();
+  private active = new Map<string, { interrupt: () => Promise<void> }>();
 
   constructor(api: Api<RawApi>, projectPath?: string) {
     this.api = api;
@@ -62,6 +92,26 @@ export class Bridge {
     }
   }
 
+  isBusy(key: string): boolean {
+    return this.busy.has(key);
+  }
+
+  // Interrupt the thread's running query and drop its queue.
+  async stop(key: string): Promise<"stopped" | "idle"> {
+    const hadQueue = (this.queues.get(key)?.length ?? 0) > 0;
+    this.queues.delete(key);
+    const running = this.active.get(key);
+    if (running) {
+      try {
+        await running.interrupt();
+      } catch {
+        // already finished
+      }
+      return "stopped";
+    }
+    return hadQueue ? "stopped" : "idle";
+  }
+
   async sendMessage(
     chatId: number,
     text: string,
@@ -69,19 +119,81 @@ export class Bridge {
     images?: { data: string; mediaType: string }[]
   ): Promise<void> {
     const key = routeKey(route);
+
+    // Busy: queue instead of dropping the message.
     if (this.busy.has(key)) {
+      const q = this.queues.get(key) ?? [];
+      if (q.length >= QUEUE_LIMIT) {
+        await sendRouted(
+          this.api,
+          chatId,
+          `Очередь полна (${QUEUE_LIMIT}). /stop — прервать текущую задачу.`,
+          route
+        );
+        return;
+      }
+      q.push({ chatId, text, route, images });
+      this.queues.set(key, q);
       await sendRouted(
         this.api,
         chatId,
-        "Still thinking on your last message... please wait.",
+        `⏳ В очереди: ${q.length}. Отправлю после текущего ответа; /stop — прервать и очистить.`,
         route
       );
       return;
     }
 
     this.busy.add(key);
+    try {
+      await this.process(key, { chatId, text, route, images });
+      // Drain messages queued while we were busy (cleared by /stop).
+      let next: PendingMessage | undefined;
+      while ((next = this.queues.get(key)?.shift()) !== undefined) {
+        await this.process(key, next);
+      }
+    } finally {
+      this.busy.delete(key);
+      this.queues.delete(key);
+    }
+  }
+
+  private async process(key: string, msg: PendingMessage): Promise<void> {
+    const { chatId, text, route, images } = msg;
     const state = this.threadState(key);
     const streamer = new Streamer(this.api, chatId, route);
+
+    // "typing" while the agent works; one call shows the status for ~5s
+    const typingExtra =
+      route.messageThreadId !== undefined
+        ? { message_thread_id: route.messageThreadId }
+        : {};
+    const sendTyping = () => {
+      this.api.sendChatAction(chatId, "typing", typingExtra).catch(() => {});
+    };
+    sendTyping();
+    const typingTimer = setInterval(sendTyping, 5000);
+
+    // One editable activity notice showing the latest tool call; deleted
+    // when the answer is done so only the answer remains in the chat.
+    let toolMsgId: number | null = null;
+    let toolCount = 0;
+    let lastToolEdit = 0;
+    const noteTool = async (line: string) => {
+      toolCount++;
+      const label = toolCount > 1 ? `⚙️ [${toolCount}] ${line}` : `⚙️ ${line}`;
+      try {
+        if (toolMsgId === null) {
+          const m = await sendRouted(this.api, chatId, label, route);
+          toolMsgId = m.message_id;
+          lastToolEdit = Date.now();
+        } else if (Date.now() - lastToolEdit > 1500) {
+          await this.api.editMessageText(chatId, toolMsgId, label);
+          lastToolEdit = Date.now();
+        }
+      } catch {
+        // cosmetics only
+      }
+    };
 
     try {
       let promptInput: any;
@@ -140,6 +252,10 @@ export class Bridge {
           settingSources: ["project"],
         },
       });
+      this.active.set(
+        key,
+        conversation as unknown as { interrupt: () => Promise<void> }
+      );
 
       for await (const message of conversation) {
         // Capture session ID from any message
@@ -150,18 +266,26 @@ export class Bridge {
         }
 
         if (message.type === "assistant" && message.message) {
-          // Extract text from content blocks
           const content = message.message.content;
           if (Array.isArray(content)) {
             for (const block of content) {
               if (block.type === "text" && block.text) {
                 await streamer.append(block.text);
+              } else if (block.type === "tool_use") {
+                const b = block as { name?: string; input?: unknown };
+                await noteTool(toolLine(b.name ?? "tool", b.input));
               }
             }
           }
         }
 
         if (message.type === "result") {
+          const duration = (message as { duration_ms?: number }).duration_ms;
+          if (typeof duration === "number" && duration > 10_000) {
+            const s = Math.round(duration / 1000);
+            const t = s >= 60 ? `${Math.floor(s / 60)}м ${s % 60}с` : `${s}с`;
+            await streamer.append(`\n\n⏱ ${t}`);
+          }
           if (message.is_error && "errors" in message) {
             const errors = (message as any).errors as string[];
             if (errors?.length) {
@@ -171,10 +295,22 @@ export class Bridge {
         }
       }
     } catch (err: any) {
-      await streamer.append(`\n\nBridge error: ${err.message || err}`);
+      if (/abort|interrupt/i.test(String(err?.message ?? err))) {
+        await streamer.append(`\n\n⏹ Прервано.`);
+      } else {
+        await streamer.append(`\n\nBridge error: ${err.message || err}`);
+      }
     } finally {
+      clearInterval(typingTimer);
+      this.active.delete(key);
+      if (toolMsgId !== null) {
+        try {
+          await this.api.deleteMessage(chatId, toolMsgId);
+        } catch {
+          // leave the notice if it cannot be removed
+        }
+      }
       await streamer.finalize();
-      this.busy.delete(key);
     }
   }
 }
