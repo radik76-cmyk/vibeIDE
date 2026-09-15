@@ -81,9 +81,21 @@ Topics turn each Telegram thread into an independent Claude Code session — one
 2. Tap the bot name → **Edit** → **Topics** → enable
 3. Restart the bot — it detects topics mode automatically
 
-### Register commands with BotFather
+### Configure via BotFather
 
-The bot registers its command menu on every startup via `setMyCommands`. If you prefer to set them manually (e.g. for a custom description), send `/setcommands` to [@BotFather](https://t.me/BotFather) and paste the list from the `/help` output.
+Open [@BotFather](https://t.me/BotFather) and send `/mybots` → select your bot → **Bot Settings**:
+
+| Setting | Command | Recommended value |
+| --- | --- | --- |
+| Name | `/setname` | `VibeIDE` (or any name you like) |
+| Description | `/setdescription` | `Claude Code from your phone. Full agent — read, edit, run — over Telegram.` |
+| About | `/setabouttext` | `Claude Code agent bridge. /help — commands` |
+| Avatar | `/setuserpic` | Any icon you like (optional) |
+| Inline mode | `/setinline` | Off (not used yet) |
+| Group mode | `/setjoingroups` | Disable — the bot is single-user |
+| Menu Button | `/setmenubutton` | Leave default (commands) |
+
+**Commands** — the bot registers its command list on every startup via `setMyCommands`, so you don't need to set them manually. If you want to override descriptions, send `/setcommands` to BotFather and paste the list from `/help`.
 
 ### Password protection (optional)
 
