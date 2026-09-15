@@ -1,5 +1,5 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { Api, RawApi } from "grammy";
+import { query, type PermissionResult } from "@anthropic-ai/claude-agent-sdk";
+import { InlineKeyboard, type Api, type RawApi } from "grammy";
 import { Streamer } from "./streamer.js";
 import { findLatestSessionId, getSessionTitle } from "./projects.js";
 import {
@@ -18,6 +18,22 @@ interface PendingMessage {
 
 const QUEUE_LIMIT = 5;
 
+// Safe mode: these run without confirmation (read-only or harmless)…
+const SAFE_TOOLS = ["Read", "Grep", "Glob", "WebSearch", "WebFetch", "Task"];
+// …while everything else (Bash, Write, Edit, …) asks with buttons.
+const ALL_TOOLS = [
+  "Read",
+  "Edit",
+  "Write",
+  "Bash",
+  "Glob",
+  "Grep",
+  "WebSearch",
+  "WebFetch",
+  "Task",
+];
+const PERM_TIMEOUT_MS = 10 * 60_000; // unanswered confirmation = deny
+
 // Compact one-line description of a tool call for the activity notice.
 function toolLine(name: string, input: unknown): string {
   const i = input as Record<string, unknown> | undefined;
@@ -35,6 +51,21 @@ function toolLine(name: string, input: unknown): string {
               : "";
   const d = String(detail).replace(/\s+/g, " ").slice(0, 60);
   return d ? `${name}: ${d}` : name;
+}
+
+// Fuller variant for confirmations: a 60-char cut could hide the dangerous
+// tail of a command, so show up to 500 chars here.
+function toolDetail(name: string, input: unknown): string {
+  const i = input as Record<string, unknown> | undefined;
+  const detail =
+    typeof i?.command === "string"
+      ? i.command
+      : typeof i?.file_path === "string"
+        ? i.file_path
+        : typeof i?.url === "string"
+          ? i.url
+          : JSON.stringify(i ?? {});
+  return `${name}: ${String(detail).slice(0, 500)}`;
 }
 
 export class Bridge {
@@ -94,6 +125,20 @@ export class Bridge {
 
   isBusy(key: string): boolean {
     return this.busy.has(key);
+  }
+
+  private pendingPerms = new Map<
+    string,
+    (v: "allow" | "deny" | "all") => void
+  >();
+
+  // Resolve a pending safe-mode confirmation; false when unknown/expired.
+  resolvePermission(id: string, verdict: "allow" | "deny" | "all"): boolean {
+    const resolve = this.pendingPerms.get(id);
+    if (!resolve) return false;
+    this.pendingPerms.delete(id);
+    resolve(verdict);
+    return true;
   }
 
   // Interrupt the thread's running query and drop its queue.
@@ -230,24 +275,86 @@ export class Bridge {
         promptInput = text;
       }
 
+      // Safe mode: dangerous tools go through a button confirmation in chat.
+      const run = { allowAll: false };
+      const canUseTool = async (
+        toolName: string,
+        input: Record<string, unknown>,
+        opts: { signal: AbortSignal }
+      ): Promise<PermissionResult> => {
+        if (run.allowAll || SAFE_TOOLS.includes(toolName)) {
+          return { behavior: "allow", updatedInput: input };
+        }
+        const detail = toolDetail(toolName, input);
+        const id = Math.random().toString(36).slice(2, 10);
+        let permMsgId: number | null = null;
+        try {
+          const m = await sendRouted(
+            this.api,
+            chatId,
+            `⚠️ Разрешить действие?\n${detail}`,
+            route,
+            {
+              reply_markup: new InlineKeyboard()
+                .text("✅ Да", `perm:${id}:allow`)
+                .text("❌ Нет", `perm:${id}:deny`)
+                .row()
+                .text("✅ Всё до конца задачи", `perm:${id}:all`),
+            }
+          );
+          permMsgId = m.message_id;
+        } catch {
+          return {
+            behavior: "deny",
+            message: "Не удалось запросить подтверждение у пользователя.",
+          };
+        }
+        const verdict = await new Promise<"allow" | "deny" | "all">(
+          (resolve) => {
+            this.pendingPerms.set(id, resolve);
+            const timer = setTimeout(() => {
+              if (this.pendingPerms.delete(id)) resolve("deny");
+            }, PERM_TIMEOUT_MS);
+            opts.signal.addEventListener("abort", () => {
+              clearTimeout(timer);
+              if (this.pendingPerms.delete(id)) resolve("deny");
+            });
+          }
+        );
+        if (permMsgId !== null) {
+          const status =
+            verdict === "deny"
+              ? "❌ Отклонено"
+              : verdict === "all"
+                ? "✅ Разрешено (и всё до конца задачи)"
+                : "✅ Разрешено";
+          this.api
+            .editMessageText(chatId, permMsgId, `${status}\n${detail}`)
+            .catch(() => {});
+        }
+        if (verdict === "all") run.allowAll = true;
+        if (verdict === "deny") {
+          return { behavior: "deny", message: "Пользователь отклонил действие." };
+        }
+        return { behavior: "allow", updatedInput: input };
+      };
+
       const conversation = query({
         prompt: promptInput,
         options: {
           cwd: state.projectPath,
           ...(state.sessionId ? { resume: state.sessionId } : {}),
-          allowedTools: [
-            "Read",
-            "Edit",
-            "Write",
-            "Bash",
-            "Glob",
-            "Grep",
-            "WebSearch",
-            "WebFetch",
-            "Task",
-          ],
-          permissionMode: "bypassPermissions",
-          allowDangerouslySkipPermissions: true,
+          ...(state.safeMode === true
+            ? {
+                allowedTools: SAFE_TOOLS,
+                permissionMode: "default" as const,
+                canUseTool,
+              }
+            : {
+                allowedTools: ALL_TOOLS,
+                permissionMode: "bypassPermissions" as const,
+                allowDangerouslySkipPermissions: true,
+              }),
           systemPrompt: { type: "preset", preset: "claude_code" },
           settingSources: ["project"],
         },

@@ -122,6 +122,8 @@ export interface ThreadState {
   sessionId?: string;
   // Last topic name set by the bot, to skip redundant renames.
   title?: string;
+  // Safe mode: dangerous tools need button confirmation (default: off).
+  safeMode?: boolean;
 }
 
 // app/src/topics.ts -> repo root
@@ -168,6 +170,11 @@ export class ThreadStore {
 
   setTitle(key: string, title: string): void {
     this.get(key).title = title;
+    this.save();
+  }
+
+  setSafeMode(key: string, on: boolean): void {
+    this.get(key).safeMode = on;
     this.save();
   }
 

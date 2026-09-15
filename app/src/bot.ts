@@ -1,5 +1,6 @@
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 import type { Message } from "grammy/types";
+import { createHash } from "crypto";
 import { mkdir, readFile, stat, unlink, writeFile } from "fs/promises";
 import { isAbsolute, join } from "path";
 import { tmpdir } from "os";
@@ -116,6 +117,77 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     await next();
   });
 
+  // Password gate (enabled when VIBEIDE_PASSWORD_HASH is set in .env).
+  // The whitelist protects against strangers; the password protects against
+  // the owner's Telegram account in the wrong hands. State is in-memory:
+  // a bot restart locks it again.
+  let unlockedUntil = 0;
+  let failedAttempts = 0;
+  let attemptsBlockedUntil = 0;
+  const AUTOLOCK_MS = config.autolockMinutes * 60_000;
+
+  bot.use(async (ctx, next) => {
+    if (!config.passwordHash) return next();
+    const now = Date.now();
+    const text = ctx.message?.text ?? "";
+
+    if (/^\/unlock(@\w+)?(\s|$)/.test(text)) {
+      const password = text.replace(/^\/unlock(@\w+)?\s*/, "");
+      // The password must not stay in the chat history.
+      ctx.api
+        .deleteMessage(ctx.chat!.id, ctx.message!.message_id)
+        .catch(() => {});
+      if (now < attemptsBlockedUntil) {
+        await replyRouted(
+          ctx,
+          `⏳ Слишком много попыток. Подожди ${Math.ceil((attemptsBlockedUntil - now) / 60_000)} мин.`
+        );
+        return;
+      }
+      const hash = createHash("sha256").update(password, "utf-8").digest("hex");
+      if (password && hash === config.passwordHash) {
+        unlockedUntil = now + AUTOLOCK_MS;
+        failedAttempts = 0;
+        await replyRouted(
+          ctx,
+          `🔓 Разблокирован на ${config.autolockMinutes} мин (продлевается активностью). /lock — заблокировать сразу.`
+        );
+      } else {
+        failedAttempts++;
+        if (failedAttempts >= 5) {
+          attemptsBlockedUntil = now + 5 * 60_000;
+          failedAttempts = 0;
+          await replyRouted(ctx, "⛔ Пять неверных паролей — пауза 5 минут.");
+        } else {
+          await replyRouted(ctx, "🔒 Неверный пароль.");
+        }
+      }
+      return;
+    }
+
+    if (/^\/lock(@\w+)?$/.test(text.trim())) {
+      unlockedUntil = 0;
+      await replyRouted(ctx, "🔒 Заблокирован. /unlock <пароль> — разблокировать.");
+      return;
+    }
+
+    if (now >= unlockedUntil) {
+      if (ctx.callbackQuery) {
+        try {
+          await ctx.answerCallbackQuery({ text: "🔒 Бот заблокирован" });
+        } catch {
+          // stale callback
+        }
+      } else {
+        await replyRouted(ctx, "🔒 Бот заблокирован. /unlock <пароль>");
+      }
+      return;
+    }
+
+    unlockedUntil = now + AUTOLOCK_MS; // sliding renewal on activity
+    await next();
+  });
+
   // Diagnostic: log topic ids of every incoming update (goes to bot.out).
   bot.use(async (ctx, next) => {
     const m = ctx.message ?? (ctx.callbackQuery?.message as Message | undefined);
@@ -164,6 +236,8 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         "/new — отвязать сессию: следующее сообщение начнёт свежую",
         "/projects — список проектов",
         "/switch — сменить проект этой вкладки",
+        "/mode safe|fast — подтверждать ли опасные действия (Bash/Write/Edit) кнопками; режим свой у каждой вкладки",
+        "/lock и /unlock <пароль> — замок бота (работает, если в .env задан VIBEIDE_PASSWORD_HASH)",
         "/restart — перезапустить бота (например, после обновления кода)",
         "/shutdown — выключить бота совсем (поднять — ярлыком на рабочем столе)",
         "/help — эта справка",
@@ -235,6 +309,40 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     );
     await bot.stop();
     process.exit(0);
+  });
+
+  // /mode safe|fast — per-topic confirmation mode for dangerous tools
+  bot.command("mode", async (ctx) => {
+    const arg = (ctx.match || "").trim().toLowerCase();
+    const key = routeKey(routeOf(ctx));
+    if (arg === "safe") {
+      bridge.store.setSafeMode(key, true);
+      await replyRouted(
+        ctx,
+        "🛡 Safe-режим этой вкладки: Bash/Write/Edit — только после подтверждения кнопками."
+      );
+    } else if (arg === "fast") {
+      bridge.store.setSafeMode(key, false);
+      await replyRouted(ctx, "⚡ Fast-режим этой вкладки: все действия без подтверждений.");
+    } else {
+      const state = bridge.threadState(key);
+      await replyRouted(
+        ctx,
+        `Режим этой вкладки: ${state.safeMode ? "🛡 safe" : "⚡ fast"}. Сменить: /mode safe | /mode fast`
+      );
+    }
+  });
+
+  // Safe-mode confirmation buttons
+  bot.callbackQuery(/^perm:/, async (ctx) => {
+    const [, id, verdict] = ctx.callbackQuery.data.split(":");
+    const ok = bridge.resolvePermission(
+      id,
+      verdict as "allow" | "deny" | "all"
+    );
+    await ctx.answerCallbackQuery(
+      ok ? undefined : { text: "Запрос уже решён или устарел" }
+    );
   });
 
   // /new command — fresh session, same project, current topic
@@ -750,6 +858,8 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     { command: "new", description: "Свежая сессия в этой вкладке" },
     { command: "projects", description: "Список проектов" },
     { command: "switch", description: "Сменить проект вкладки" },
+    { command: "mode", description: "Режим вкладки: safe (с подтверждениями) | fast" },
+    { command: "lock", description: "Заблокировать бота (если задан пароль)" },
     { command: "help", description: "Справка по командам и вкладкам" },
     { command: "restart", description: "Перезапустить бота" },
     { command: "shutdown", description: "Выключить бота" },

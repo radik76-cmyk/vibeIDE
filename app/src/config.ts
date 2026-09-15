@@ -3,6 +3,10 @@ import "dotenv/config";
 export interface Config {
   telegramBotToken: string;
   allowedUserId: number;
+  /** sha256 hex of the access password; unset = password gate disabled */
+  passwordHash?: string;
+  /** auto-lock after this many minutes of inactivity (default 60) */
+  autolockMinutes: number;
 }
 
 export function loadConfig(): Config {
@@ -20,5 +24,10 @@ export function loadConfig(): Config {
     throw new Error("TELEGRAM_ALLOWED_USER_ID must be a number");
   }
 
-  return { telegramBotToken: token, allowedUserId };
+  const passwordHash =
+    process.env.VIBEIDE_PASSWORD_HASH?.trim().toLowerCase() || undefined;
+  const autolockMinutes =
+    parseInt(process.env.VIBEIDE_AUTOLOCK_MIN || "", 10) || 60;
+
+  return { telegramBotToken: token, allowedUserId, passwordHash, autolockMinutes };
 }
