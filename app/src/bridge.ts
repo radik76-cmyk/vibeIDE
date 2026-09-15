@@ -73,7 +73,7 @@ export class Bridge {
   private api: Api<RawApi>;
   private busy = new Set<string>();
   private queues = new Map<string, PendingMessage[]>();
-  private active = new Map<string, { abort: AbortController; close: () => void }>();
+  private active = new Map<string, { abort: AbortController; close: () => void; aborted: boolean }>();
 
   constructor(api: Api<RawApi>, projectPath?: string) {
     this.api = api;
@@ -177,6 +177,7 @@ export class Bridge {
     this.queues.delete(key);
     const running = this.active.get(key);
     if (running) {
+      running.aborted = true;
       try {
         running.abort.abort();
         running.close();
@@ -420,6 +421,7 @@ export class Bridge {
       this.active.set(key, {
         abort: abortCtl,
         close: () => (conversation as any).close?.(),
+        aborted: false,
       });
 
       for await (const message of conversation) {
@@ -484,13 +486,17 @@ export class Bridge {
         );
         return this.runQuery(key, msg, state, true);
       }
-      if (/abort|interrupt/i.test(String(err?.message ?? err))) {
+      const wasAborted = this.active.get(key)?.aborted ||
+        /abort|interrupt/i.test(String(err?.message ?? err));
+      if (wasAborted) {
         await streamer.append(`\n\n⏹ Прервано.`);
       } else {
         await streamer.append(`\n\nBridge error: ${err.message || err}`);
       }
     } finally {
       clearInterval(typingTimer);
+      const entry = this.active.get(key);
+      const wasAborted = entry?.aborted ?? false;
       this.active.delete(key);
       if (toolMsgId !== null) {
         try {
@@ -498,6 +504,10 @@ export class Bridge {
         } catch {
           // leave the notice if it cannot be removed
         }
+      }
+      // If /stop killed the query without throwing, still notify the user.
+      if (wasAborted) {
+        await streamer.append(`\n\n⏹ Прервано.`);
       }
       await streamer.finalize();
       await this.setTopicBusy(chatId, route, false);
