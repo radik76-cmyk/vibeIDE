@@ -8,3 +8,4 @@ bot.out
 bot.err
 topics.json
 inbox/
+restart.json

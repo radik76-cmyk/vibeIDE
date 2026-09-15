@@ -1,6 +1,6 @@
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 import type { Message } from "grammy/types";
-import { mkdir, stat, unlink, writeFile } from "fs/promises";
+import { mkdir, readFile, stat, unlink, writeFile } from "fs/promises";
 import { isAbsolute, join } from "path";
 import { tmpdir } from "os";
 import type { Config } from "./config.js";
@@ -24,6 +24,11 @@ import {
 
 // Directory where files sent to the bot are saved for the agent to read.
 const INBOX_DIR = join(process.cwd(), "inbox");
+
+// The launcher .vbs restarts the bot when it exits with this code.
+const RESTART_CODE = 42;
+// Where /restart leaves a note for the fresh process to confirm the restart.
+const RESTART_FLAG = join(process.cwd(), "restart.json");
 
 function sanitizeFileName(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, "_").slice(0, 120) || "file";
@@ -159,6 +164,8 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         "/new — отвязать сессию: следующее сообщение начнёт свежую",
         "/projects — список проектов",
         "/switch — сменить проект этой вкладки",
+        "/restart — перезапустить бота (например, после обновления кода)",
+        "/shutdown — выключить бота совсем (поднять — ярлыком на рабочем столе)",
         "/help — эта справка",
         "",
         "*Пометки в /sessions:*",
@@ -200,6 +207,34 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         ? "⏹ Останавливаю. Очередь очищена."
         : "Сейчас ничего не выполняется."
     );
+  });
+
+  // /restart — exit with RESTART_CODE so the launcher loop starts us again.
+  // bot.stop() first: it confirms the update offset, otherwise Telegram
+  // redelivers /restart to the fresh process and the bot loops forever.
+  bot.command("restart", async (ctx) => {
+    await replyRouted(ctx, "🔄 Перезапускаюсь…");
+    try {
+      await writeFile(
+        RESTART_FLAG,
+        JSON.stringify({ chatId: ctx.chat.id, route: routeOf(ctx) }),
+        "utf-8"
+      );
+    } catch {
+      // confirmation is optional
+    }
+    await bot.stop();
+    process.exit(RESTART_CODE);
+  });
+
+  // /shutdown — stop the bot completely (the launcher loop ends too).
+  bot.command("shutdown", async (ctx) => {
+    await replyRouted(
+      ctx,
+      "⏻ Выключаюсь. Поднять — ярлыком VibeIDE на рабочем столе."
+    );
+    await bot.stop();
+    process.exit(0);
   });
 
   // /new command — fresh session, same project, current topic
@@ -716,7 +751,20 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     { command: "projects", description: "Список проектов" },
     { command: "switch", description: "Сменить проект вкладки" },
     { command: "help", description: "Справка по командам и вкладкам" },
+    { command: "restart", description: "Перезапустить бота" },
+    { command: "shutdown", description: "Выключить бота" },
   ]);
+
+  // Confirm a /restart to the topic that requested it.
+  try {
+    const raw = JSON.parse(await readFile(RESTART_FLAG, "utf-8"));
+    await unlink(RESTART_FLAG).catch(() => {});
+    if (raw?.chatId) {
+      await sendRouted(bot.api, raw.chatId, "✅ Перезапущен.", raw.route ?? {});
+    }
+  } catch {
+    // no restart pending
+  }
 
   return bot;
 }
