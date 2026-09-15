@@ -71,6 +71,45 @@ npx tsx app/src/index.ts ~/Code/my-project
 
 Send a message on Telegram. You're in.
 
+## Bot Setup
+
+### Enable Topics (recommended)
+
+Topics turn each Telegram thread into an independent Claude Code session — one tab per task. Without topics, everything goes into a single chat.
+
+1. Open your bot chat in Telegram
+2. Tap the bot name → **Edit** → **Topics** → enable
+3. Restart the bot — it detects topics mode automatically
+
+### Register commands with BotFather
+
+The bot registers its command menu on every startup via `setMyCommands`. If you prefer to set them manually (e.g. for a custom description), send `/setcommands` to [@BotFather](https://t.me/BotFather) and paste the list from the `/help` output.
+
+### Password protection (optional)
+
+Generate a SHA-256 hash of your password and add it to `.env`:
+
+```bash
+echo -n "your-password" | sha256sum
+```
+
+```
+VIBEIDE_PASSWORD_HASH=5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8
+VIBEIDE_AUTOLOCK_MIN=60
+```
+
+Each tab locks independently after the timeout. `/unlock <password>` unlocks, `/lock` locks immediately. Activity extends the timer.
+
+### Windows autostart
+
+On Windows, VibeIDE ships with a `.vbs` launcher that runs in the background and auto-restarts the bot on `/restart`. Create a shortcut to `run-vibeide.vbs` on the desktop or in the Startup folder.
+
+### Settings panel
+
+`/settings` shows all tab settings in one message with inline buttons — model, speed, mode. Tap to change, the panel updates in place. Individual commands (`/model`, `/speed`, `/mode`) still work for text-based workflows.
+
+A Telegram [Mini App](https://core.telegram.org/bots/webapps) upgrade with sliders and richer UI is on the [Roadmap](#roadmap).
+
 ## What You Can Do
 
 VibeIDE gives you the **full Claude Code agent** over Telegram. Everything Claude Code can do in a terminal, you can do from your phone.
@@ -220,6 +259,7 @@ Every chat tab (topic) is an independent Claude Code session.
 
 | Command | What it does |
 | --- | --- |
+| `/settings` | Visual settings panel — model, speed, mode — all in one message with inline buttons |
 | `/lock` / `/unlock <pw>` | Lock/unlock the bot (per-tab, when `VIBEIDE_PASSWORD_HASH` is set) |
 | `/mode safe\|fast` | Safe = confirm Bash/Write/Edit with buttons; fast = no confirmations |
 | `/restart` | Restart the bot process |
@@ -290,6 +330,12 @@ This is the same trust model as running Claude Code in your terminal — because
 - Node.js >= 18
 - Claude Code installed and logged in (`claude login`), or an [Anthropic API key](https://console.anthropic.com/)
 - A Telegram account + bot token from [@BotFather](https://t.me/BotFather)
+
+## Roadmap
+
+- [ ] **Settings Mini App** — Telegram WebApp panel for visual configuration: model picker, speed slider, safe mode toggle, project/session switcher. Opens from a button in `/settings` or the bot menu. Replaces most slash commands with a tap-friendly UI.
+- [ ] **Voice messages** — transcribe voice messages and send them to Claude as text.
+- [ ] **Inline results** — `@vibeide_bot query` from any Telegram chat to get quick answers without switching to the bot.
 
 ## Contributing
 

@@ -306,6 +306,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         "/speed — скорость мышления: fast, normal, deep — или число токенов",
         "",
         "<b>Управление</b>",
+        "/settings — панель настроек вкладки (модель, скорость, режим)",
         "/lock, /unlock <code>&lt;пароль&gt;</code> — замок бота",
         "/mode <code>safe|fast</code> — подтверждать ли Bash/Write/Edit кнопками",
         "/restart — перезапустить бота",
@@ -598,6 +599,93 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         `Режим вкладки: ${state.safeMode ? "🛡 <b>safe</b>" : "⚡ <b>fast</b>"}. Сменить: /mode safe | /mode fast`,
         { parse_mode: "HTML" }
       );
+    }
+  });
+
+  // /settings — unified settings panel with inline buttons
+  function settingsText(key: string): string {
+    const state = bridge.threadState(key);
+    const modelLabel = state.model
+      ? Object.values(MODEL_PRESETS).find((p) => p.id === state.model)?.label ?? state.model
+      : "авто";
+    const speedEntry = Object.entries(SPEED_PRESETS).find(
+      ([, p]) => p.tokens === state.maxThinkingTokens
+    );
+    const speedLabel = speedEntry
+      ? `${speedEntry[1].emoji} ${speedEntry[1].label}`
+      : state.maxThinkingTokens
+        ? `🎛 ${state.maxThinkingTokens}`
+        : "🔹 Нормальный";
+    const modeLabel = state.safeMode ? "🛡 safe" : "⚡ fast";
+    return [
+      "<b>Настройки вкладки</b>",
+      "",
+      `🧠 Модель: <b>${escHtml(modelLabel)}</b>`,
+      `⏩ Скорость: <b>${escHtml(speedLabel)}</b>`,
+      `🔧 Режим: <b>${modeLabel}</b>`,
+    ].join("\n");
+  }
+
+  function settingsKeyboard(key: string): InlineKeyboard {
+    const state = bridge.threadState(key);
+    const kb = new InlineKeyboard();
+    // Row 1 — model quick picks (top 4)
+    const topModels = Object.entries(MODEL_PRESETS).slice(0, 4);
+    for (const [slug, preset] of topModels) {
+      const mark = state.model === preset.id ? "● " : "";
+      kb.text(`${mark}${preset.label}`, `set:model:${slug}`);
+    }
+    kb.row();
+    // Row 2 — speed
+    for (const [slug, preset] of Object.entries(SPEED_PRESETS)) {
+      const mark = (state.maxThinkingTokens === preset.tokens) ||
+        (!state.maxThinkingTokens && !preset.tokens) ? "● " : "";
+      kb.text(`${mark}${preset.emoji} ${preset.label}`, `set:speed:${slug}`);
+    }
+    kb.row();
+    // Row 3 — mode toggle
+    kb.text(
+      state.safeMode ? "🛡 Safe → ⚡ Fast" : "⚡ Fast → 🛡 Safe",
+      `set:mode:${state.safeMode ? "fast" : "safe"}`
+    );
+    return kb;
+  }
+
+  bot.command("settings", async (ctx) => {
+    const key = routeKey(routeOf(ctx));
+    await replyRouted(ctx, settingsText(key), {
+      parse_mode: "HTML",
+      reply_markup: settingsKeyboard(key),
+    });
+  });
+
+  bot.callbackQuery(/^set:/, async (ctx) => {
+    const parts = ctx.callbackQuery.data.split(":");
+    const [, category, value] = parts;
+    const key = routeKey(routeOf(ctx));
+
+    if (category === "model") {
+      if (value === "reset") {
+        bridge.store.setModel(key, undefined);
+      } else {
+        const preset = MODEL_PRESETS[value];
+        if (preset) bridge.store.setModel(key, preset.id);
+      }
+    } else if (category === "speed") {
+      const preset = SPEED_PRESETS[value];
+      if (preset) bridge.store.setMaxThinkingTokens(key, preset.tokens);
+    } else if (category === "mode") {
+      bridge.store.setSafeMode(key, value === "safe");
+    }
+
+    await ctx.answerCallbackQuery();
+    try {
+      await ctx.editMessageText(settingsText(key), {
+        parse_mode: "HTML",
+        reply_markup: settingsKeyboard(key),
+      });
+    } catch {
+      // message unchanged
     }
   });
 
@@ -1149,6 +1237,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     { command: "restart", description: "Перезапустить бота" },
     { command: "resume", description: "Привязать сессию по id" },
     { command: "sessions", description: "Выбрать сессию для этой вкладки" },
+    { command: "settings", description: "Панель настроек вкладки" },
     { command: "shutdown", description: "Выключить бота" },
     { command: "speed", description: "Скорость: fast, normal, deep" },
     { command: "status", description: "Проект и сессия этой вкладки" },
