@@ -73,7 +73,7 @@ export class Bridge {
   private api: Api<RawApi>;
   private busy = new Set<string>();
   private queues = new Map<string, PendingMessage[]>();
-  private active = new Map<string, { interrupt: () => Promise<void> }>();
+  private active = new Map<string, { abort: AbortController; close: () => void }>();
 
   constructor(api: Api<RawApi>, projectPath?: string) {
     this.api = api;
@@ -178,7 +178,8 @@ export class Bridge {
     const running = this.active.get(key);
     if (running) {
       try {
-        await running.interrupt();
+        running.abort.abort();
+        running.close();
       } catch {
         // already finished
       }
@@ -289,6 +290,7 @@ export class Bridge {
     };
 
     const useResume = !skipResume && !!state.sessionId;
+    const abortCtl = new AbortController();
 
     try {
       let promptInput: any;
@@ -393,6 +395,7 @@ export class Bridge {
       const conversation = query({
         prompt: promptInput,
         options: {
+          abortController: abortCtl,
           cwd: state.projectPath,
           ...(useResume ? { resume: state.sessionId } : {}),
           ...(state.model ? { model: state.model } : {}),
@@ -414,10 +417,10 @@ export class Bridge {
           settingSources: ["project"],
         },
       });
-      this.active.set(
-        key,
-        conversation as unknown as { interrupt: () => Promise<void> }
-      );
+      this.active.set(key, {
+        abort: abortCtl,
+        close: () => (conversation as any).close?.(),
+      });
 
       for await (const message of conversation) {
         // Capture session ID from any message
