@@ -105,6 +105,16 @@ export class Bridge {
     const title = await getSessionTitle(state.projectPath, state.sessionId);
     if (!title || title === state.title) return;
     const name = title.length > 128 ? title.slice(0, 127) + "…" : title;
+    await this.setTopicName(chatId, route, name);
+    this.store.setTitle(key, title);
+  }
+
+  // Low-level topic rename; tries both id kinds, silently gives up on failure.
+  private async setTopicName(
+    chatId: number,
+    route: ThreadRoute,
+    name: string
+  ): Promise<void> {
     const ids = [
       ...new Set(
         [route.directMessagesTopicId, route.messageThreadId].filter(
@@ -115,12 +125,32 @@ export class Bridge {
     for (const id of ids) {
       try {
         await this.api.editForumTopic(chatId, id, { name });
-        this.store.setTitle(key, title);
         return;
       } catch {
         // wrong id kind or no rights — try the other id, else give up
       }
     }
+  }
+
+  // Show a "working" prefix on the topic tab while the agent is busy,
+  // then restore the original name. For "main" (no topics) this is a no-op.
+  private async setTopicBusy(
+    chatId: number,
+    route: ThreadRoute,
+    busy: boolean
+  ): Promise<void> {
+    const key = routeKey(route);
+    if (key === "main") return;
+    const state = this.store.get(key);
+    const base =
+      state.title ||
+      (state.sessionId
+        ? await getSessionTitle(state.projectPath, state.sessionId)
+        : undefined);
+    if (!base) return;
+    const name = busy ? `⚙️ ${base}` : base;
+    const trimmed = name.length > 128 ? name.slice(0, 127) + "…" : name;
+    await this.setTopicName(chatId, route, trimmed);
   }
 
   isBusy(key: string): boolean {
@@ -205,7 +235,25 @@ export class Bridge {
   private async process(key: string, msg: PendingMessage): Promise<void> {
     const { chatId, text, route, images } = msg;
     const state = this.threadState(key);
+
+    // /fresh sets freshNext — skip resume for this one message.
+    const skipResume = state.freshNext === true;
+    if (skipResume) this.store.setFreshNext(key, false);
+
+    await this.runQuery(key, msg, state, skipResume);
+  }
+
+  private async runQuery(
+    key: string,
+    msg: PendingMessage,
+    state: ReturnType<Bridge["threadState"]>,
+    skipResume: boolean
+  ): Promise<void> {
+    const { chatId, text, route, images } = msg;
     const streamer = new Streamer(this.api, chatId, route);
+
+    // Mark the topic tab as busy so it's visible in the tab list.
+    await this.setTopicBusy(chatId, route, true);
 
     // "typing" while the agent works; one call shows the status for ~5s
     const typingExtra =
@@ -239,6 +287,8 @@ export class Bridge {
         // cosmetics only
       }
     };
+
+    const useResume = !skipResume && !!state.sessionId;
 
     try {
       let promptInput: any;
@@ -292,9 +342,10 @@ export class Bridge {
           const m = await sendRouted(
             this.api,
             chatId,
-            `⚠️ Разрешить действие?\n${detail}`,
+            `⚠️ Разрешить действие?\n<code>${detail.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</code>`,
             route,
             {
+              parse_mode: "HTML",
               reply_markup: new InlineKeyboard()
                 .text("✅ Да", `perm:${id}:allow`)
                 .text("❌ Нет", `perm:${id}:deny`)
@@ -329,7 +380,7 @@ export class Bridge {
                 ? "✅ Разрешено (и всё до конца задачи)"
                 : "✅ Разрешено";
           this.api
-            .editMessageText(chatId, permMsgId, `${status}\n${detail}`)
+            .editMessageText(chatId, permMsgId, `${status}\n<code>${detail.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</code>`, { parse_mode: "HTML" })
             .catch(() => {});
         }
         if (verdict === "all") run.allowAll = true;
@@ -343,7 +394,11 @@ export class Bridge {
         prompt: promptInput,
         options: {
           cwd: state.projectPath,
-          ...(state.sessionId ? { resume: state.sessionId } : {}),
+          ...(useResume ? { resume: state.sessionId } : {}),
+          ...(state.model ? { model: state.model } : {}),
+          ...(state.maxThinkingTokens
+            ? { maxThinkingTokens: state.maxThinkingTokens }
+            : {}),
           ...(state.safeMode === true
             ? {
                 allowedTools: SAFE_TOOLS,
@@ -402,6 +457,30 @@ export class Bridge {
         }
       }
     } catch (err: any) {
+      // Auto-retry without resume when the session history is too large.
+      if (
+        useResume &&
+        /prompt.*(too long|too large)|context.*overflow/i.test(
+          String(err?.message ?? err)
+        )
+      ) {
+        clearInterval(typingTimer);
+        this.active.delete(key);
+        if (toolMsgId !== null) {
+          this.api.deleteMessage(chatId, toolMsgId).catch(() => {});
+          toolMsgId = null;
+        }
+        await streamer.finalize();
+        await this.setTopicBusy(chatId, route, false);
+        await sendRouted(
+          this.api,
+          chatId,
+          "⚠️ Сессия слишком длинная для resume — повторяю <b>без истории</b> (новая сессия).",
+          route,
+          { parse_mode: "HTML" }
+        );
+        return this.runQuery(key, msg, state, true);
+      }
       if (/abort|interrupt/i.test(String(err?.message ?? err))) {
         await streamer.append(`\n\n⏹ Прервано.`);
       } else {
@@ -418,6 +497,7 @@ export class Bridge {
         }
       }
       await streamer.finalize();
+      await this.setTopicBusy(chatId, route, false);
     }
   }
 }

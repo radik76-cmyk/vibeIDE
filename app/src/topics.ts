@@ -124,6 +124,12 @@ export interface ThreadState {
   title?: string;
   // Safe mode: dangerous tools need button confirmation (default: off).
   safeMode?: boolean;
+  // When true, the next message is sent without resume (one-shot, not persisted).
+  freshNext?: boolean;
+  // Claude model override (e.g. "claude-sonnet-4-5-20250929"). Unset = SDK default.
+  model?: string;
+  // Thinking budget override. Unset = SDK default.
+  maxThinkingTokens?: number;
 }
 
 // app/src/topics.ts -> repo root
@@ -175,6 +181,21 @@ export class ThreadStore {
 
   setSafeMode(key: string, on: boolean): void {
     this.get(key).safeMode = on;
+    this.save();
+  }
+
+  setFreshNext(key: string, on: boolean): void {
+    this.get(key).freshNext = on;
+    // Not persisted: freshNext is one-shot and in-memory only.
+  }
+
+  setModel(key: string, model: string | undefined): void {
+    this.get(key).model = model;
+    this.save();
+  }
+
+  setMaxThinkingTokens(key: string, tokens: number | undefined): void {
+    this.get(key).maxThinkingTokens = tokens;
     this.save();
   }
 

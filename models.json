@@ -1,0 +1,18 @@
+{
+  "presets": {
+    "fable5.1": { "id": "claude-fable-5-1", "label": "Fable 5.1" },
+    "opus5":    { "id": "claude-opus-5", "label": "Opus 5" },
+    "sonnet5":  { "id": "claude-sonnet-5", "label": "Sonnet 5" },
+    "haiku":    { "id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5" },
+    "opus4":    { "id": "claude-opus-4-5-20250929", "label": "Opus 4.5" },
+    "sonnet4":  { "id": "claude-sonnet-4-5-20250929", "label": "Sonnet 4.5" }
+  },
+  "aliases": {
+    "fable": "fable5.1", "fable5": "fable5.1", "fable-5.1": "fable5.1", "fable-5": "fable5.1",
+    "opus": "opus5", "opus-5": "opus5",
+    "sonnet": "sonnet5", "sonnet-5": "sonnet5",
+    "haiku4.5": "haiku", "haiku-4.5": "haiku", "haiku4": "haiku", "haiku-4": "haiku",
+    "opus4.5": "opus4", "opus-4.5": "opus4", "opus-4": "opus4",
+    "sonnet4.5": "sonnet4", "sonnet-4.5": "sonnet4", "sonnet-4": "sonnet4"
+  }
+}

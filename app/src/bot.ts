@@ -35,6 +35,11 @@ function sanitizeFileName(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, "_").slice(0, 120) || "file";
 }
 
+// Escape special HTML characters for Telegram parse_mode: "HTML".
+function escHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 // Optimal string alignment distance (Levenshtein + adjacent transposition).
 function osaDistance(a: string, b: string): number {
   const d: number[][] = Array.from({ length: a.length + 1 }, (_, i) =>
@@ -146,17 +151,31 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
   // Password gate (enabled when VIBEIDE_PASSWORD_HASH is set in .env).
   // The whitelist protects against strangers; the password protects against
-  // the owner's Telegram account in the wrong hands. State is in-memory:
-  // a bot restart locks it again.
-  let unlockedUntil = 0;
-  let failedAttempts = 0;
-  let attemptsBlockedUntil = 0;
+  // the owner's Telegram account in the wrong hands. State is per-topic and
+  // in-memory: a bot restart locks every topic again.
+  interface LockState {
+    unlockedUntil: number;
+    failedAttempts: number;
+    attemptsBlockedUntil: number;
+  }
+  const lockStates = new Map<string, LockState>();
   const AUTOLOCK_MS = config.autolockMinutes * 60_000;
+
+  function getLock(key: string): LockState {
+    let s = lockStates.get(key);
+    if (!s) {
+      s = { unlockedUntil: 0, failedAttempts: 0, attemptsBlockedUntil: 0 };
+      lockStates.set(key, s);
+    }
+    return s;
+  }
 
   bot.use(async (ctx, next) => {
     if (!config.passwordHash) return next();
     const now = Date.now();
     const text = ctx.message?.text ?? "";
+    const key = routeKey(routeOf(ctx));
+    const lock = getLock(key);
 
     if (looksLikeUnlockAttempt(text)) {
       const password = text.trim().split(/\s+/).slice(1).join(" ");
@@ -165,29 +184,30 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         .deleteMessage(ctx.chat!.id, ctx.message!.message_id)
         .catch(() => {});
       if (!password) {
-        await replyRouted(ctx, "Использование: /unlock <пароль>");
+        await replyRouted(ctx, "Использование: /unlock <code>&lt;пароль&gt;</code>", { parse_mode: "HTML" });
         return;
       }
-      if (now < attemptsBlockedUntil) {
+      if (now < lock.attemptsBlockedUntil) {
         await replyRouted(
           ctx,
-          `⏳ Слишком много попыток. Подожди ${Math.ceil((attemptsBlockedUntil - now) / 60_000)} мин.`
+          `⏳ Слишком много попыток. Подожди ${Math.ceil((lock.attemptsBlockedUntil - now) / 60_000)} мин.`
         );
         return;
       }
       const hash = createHash("sha256").update(password, "utf-8").digest("hex");
       if (hash === config.passwordHash) {
-        unlockedUntil = now + AUTOLOCK_MS;
-        failedAttempts = 0;
+        lock.unlockedUntil = now + AUTOLOCK_MS;
+        lock.failedAttempts = 0;
         await replyRouted(
           ctx,
-          `🔓 Разблокирован на ${config.autolockMinutes} мин (продлевается активностью). /lock — заблокировать сразу.`
+          `🔓 Вкладка разблокирована на ${config.autolockMinutes} мин (продлевается активностью). /lock — заблокировать.`,
+          { parse_mode: "HTML" }
         );
       } else {
-        failedAttempts++;
-        if (failedAttempts >= 5) {
-          attemptsBlockedUntil = now + 5 * 60_000;
-          failedAttempts = 0;
+        lock.failedAttempts++;
+        if (lock.failedAttempts >= 5) {
+          lock.attemptsBlockedUntil = now + 5 * 60_000;
+          lock.failedAttempts = 0;
           await replyRouted(ctx, "⛔ Пять неверных паролей — пауза 5 минут.");
         } else {
           await replyRouted(ctx, "🔒 Неверный пароль.");
@@ -197,15 +217,15 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     }
 
     if (/^\/lock(@\w+)?$/.test(text.trim())) {
-      unlockedUntil = 0;
-      await replyRouted(ctx, "🔒 Заблокирован. /unlock <пароль> — разблокировать.");
+      lock.unlockedUntil = 0;
+      await replyRouted(ctx, "🔒 Вкладка заблокирована. /unlock <code>&lt;пароль&gt;</code>", { parse_mode: "HTML" });
       return;
     }
 
-    if (now >= unlockedUntil) {
+    if (now >= lock.unlockedUntil) {
       if (ctx.callbackQuery) {
         try {
-          await ctx.answerCallbackQuery({ text: "🔒 Бот заблокирован" });
+          await ctx.answerCallbackQuery({ text: "🔒 Вкладка заблокирована" });
         } catch {
           // stale callback
         }
@@ -219,13 +239,14 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         }
         await replyRouted(
           ctx,
-          "🔒 Бот заблокирован, сообщение удалено. /unlock <пароль>"
+          "🔒 Вкладка заблокирована, сообщение удалено. /unlock <code>&lt;пароль&gt;</code>",
+          { parse_mode: "HTML" }
         );
       }
       return;
     }
 
-    unlockedUntil = now + AUTOLOCK_MS; // sliding renewal on activity
+    lock.unlockedUntil = now + AUTOLOCK_MS; // sliding renewal on activity
     await next();
   });
 
@@ -249,8 +270,8 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     const state = bridge.threadState(routeKey(routeOf(ctx)));
     await replyRouted(
       ctx,
-      `VibeIDE connected.\nProject: \`${state.projectPath}\`\n\nEach chat topic runs its own session: a new topic starts a fresh one.\n\n/help — справка по командам и вкладкам`,
-      { parse_mode: "Markdown" }
+      `<b>VibeIDE connected.</b>\nПроект: <code>${escHtml(state.projectPath)}</code>\n\nКаждая вкладка чата — отдельная сессия. Новая вкладка = новая сессия.\n\n/help — справка по командам`,
+      { parse_mode: "HTML" }
     );
   });
 
@@ -259,40 +280,47 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     await replyRouted(
       ctx,
       [
-        "*Справка VibeIDE*",
+        "<b>Справка VibeIDE</b>",
         "",
         "Каждая вкладка (тема) чата — отдельная сессия Claude Code:",
-        "• пишешь *внутри вкладки* — продолжаешь её сессию;",
-        "• пишешь *из корня чата* — Telegram создаёт новую вкладку, бот заведёт в ней свежую сессию;",
-        "• вкладка сама переименовывается по имени сессии.",
+        "• пишешь <b>внутри вкладки</b> — продолжаешь её сессию",
+        "• пишешь <b>из корня чата</b> — Telegram создаёт новую вкладку, бот заведёт свежую сессию",
+        "• вкладка сама переименовывается по имени сессии",
         "",
-        "*Команды* (действуют на вкладку, где написаны):",
-        "/status — проект, вкладка и сессия",
-        "/stop — прервать текущую задачу и очистить очередь",
-        "/sessions — выбрать сессию (листается кнопками Ещё/Назад)",
-        "/resume <id> — привязать сессию по id (хватит первых 8 символов)",
-        "/history [n] — последние n реплик сессии; /history all — вся история файлом",
-        "/rename <имя> — переименовать сессию (и вкладку); имя видно и в терминале",
-        "/get <путь> — прислать файл из проекта в чат",
+        "<b>Сессия</b>",
+        "/fresh — следующее сообщение <b>без истории</b> (новая сессия, старая в /sessions)",
+        "/history <code>[n]</code> — последние n реплик; <code>all</code> — вся история файлом",
         "/new — отвязать сессию: следующее сообщение начнёт свежую",
+        "/rename <code>&lt;имя&gt;</code> — переименовать сессию и вкладку",
+        "/resume <code>&lt;id&gt;</code> — привязать сессию по id (хватит первых 8 символов)",
+        "/sessions — выбрать сессию (листается кнопками)",
+        "/status — проект, вкладка и сессия",
+        "",
+        "<b>Проект</b>",
+        "/get <code>&lt;путь&gt;</code> — прислать файл из проекта в чат",
         "/projects — список проектов",
         "/switch — сменить проект этой вкладки",
-        "/mode safe|fast — подтверждать ли опасные действия (Bash/Write/Edit) кнопками; режим свой у каждой вкладки",
-        "/lock и /unlock <пароль> — замок бота (работает, если в .env задан VIBEIDE_PASSWORD_HASH)",
-        "/restart — перезапустить бота (например, после обновления кода)",
-        "/shutdown — выключить бота совсем (поднять — ярлыком на рабочем столе)",
-        "/help — эта справка",
         "",
-        "*Пометки в /sessions:*",
+        "<b>Модель и скорость</b>",
+        "/model — модель: fable, opus, sonnet, haiku (+ opus4, sonnet4) или полный ID",
+        "/speed — скорость мышления: fast, normal, deep — или число токенов",
+        "",
+        "<b>Управление</b>",
+        "/lock, /unlock <code>&lt;пароль&gt;</code> — замок бота",
+        "/mode <code>safe|fast</code> — подтверждать ли Bash/Write/Edit кнопками",
+        "/restart — перезапустить бота",
+        "/shutdown — выключить бота",
+        "/stop — прервать текущую задачу и очистить очередь",
+        "",
+        "<b>Пометки в /sessions</b>",
         "● — сессия этой вкладки",
-        "📌 — уже открыта в другой вкладке; при выборе бот предложит «Take over here» — забрать сюда",
-        "🟢 — пишется прямо сейчас (например, открыта в терминале — лучше не трогать)",
+        "📌 — открыта в другой вкладке (можно забрать «Take over here»)",
+        "🟢 — кто-то пишет прямо сейчас (терминал — лучше не трогать)",
         "",
-        "Пока бот занят, новые сообщения встают в очередь (до 5).",
-        "Во время работы бот показывает «печатает…» и текущий инструмент (⚙️).",
-        "Фото и файлы можно отправлять с подписью: фото бот видит, файл сохраняет и передаёт агенту путь.",
+        "Пока бот занят, сообщения встают в очередь (до 5).",
+        "Фото бот видит; файлы сохраняет и передаёт агенту путь.",
       ].join("\n"),
-      { parse_mode: "Markdown" }
+      { parse_mode: "HTML" }
     );
   });
 
@@ -300,16 +328,16 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   bot.command("status", async (ctx) => {
     const state = bridge.threadState(routeKey(routeOf(ctx)));
     await bridge.syncTopicTitle(ctx.chat.id, routeOf(ctx));
-    let sessionInfo = "none (will start on next message)";
+    let sessionInfo = "нет (начнётся со следующего сообщения)";
     if (state.sessionId) {
       const title = await getSessionTitle(state.projectPath, state.sessionId);
       const shortId = state.sessionId.slice(0, 8);
-      sessionInfo = title ? `**${title}** (\`${shortId}\`)` : `\`${shortId}...\``;
+      sessionInfo = title ? `<b>${escHtml(title)}</b> (<code>${shortId}</code>)` : `<code>${shortId}…</code>`;
     }
     await replyRouted(
       ctx,
-      `Project: \`${state.projectPath}\`\nTopic: \`${routeKey(routeOf(ctx))}\`\nSession: ${sessionInfo}`,
-      { parse_mode: "Markdown" }
+      `<b>Проект:</b> <code>${escHtml(state.projectPath)}</code>\n<b>Вкладка:</b> <code>${routeKey(routeOf(ctx))}</code>\n<b>Сессия:</b> ${sessionInfo}`,
+      { parse_mode: "HTML" }
     );
   });
 
@@ -352,6 +380,199 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     process.exit(0);
   });
 
+  // /model — switch Claude model for this topic
+  // Models are loaded from models.json (next to topics.json); if missing,
+  // built-in defaults are used.  /model reload re-reads the file at runtime.
+  const MODELS_FILE = join(process.cwd(), "models.json");
+
+  interface ModelCatalog {
+    presets: Record<string, { id: string; label: string }>;
+    aliases: Record<string, string>;
+  }
+
+  const BUILTIN_PRESETS: ModelCatalog["presets"] = {
+    "fable5.1": { id: "claude-fable-5-1", label: "Fable 5.1" },
+    opus5:      { id: "claude-opus-5", label: "Opus 5" },
+    sonnet5:    { id: "claude-sonnet-5", label: "Sonnet 5" },
+    haiku:      { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+    opus4:      { id: "claude-opus-4-5-20250929", label: "Opus 4.5" },
+    sonnet4:    { id: "claude-sonnet-4-5-20250929", label: "Sonnet 4.5" },
+  };
+  const BUILTIN_ALIASES: ModelCatalog["aliases"] = {
+    "fable": "fable5.1", "fable5": "fable5.1", "fable-5.1": "fable5.1", "fable-5": "fable5.1",
+    "opus": "opus5", "opus-5": "opus5",
+    "sonnet": "sonnet5", "sonnet-5": "sonnet5",
+    "haiku4.5": "haiku", "haiku-4.5": "haiku", "haiku4": "haiku", "haiku-4": "haiku",
+    "opus4.5": "opus4", "opus-4.5": "opus4", "opus-4": "opus4",
+    "sonnet4.5": "sonnet4", "sonnet-4.5": "sonnet4", "sonnet-4": "sonnet4",
+  };
+
+  let MODEL_PRESETS = { ...BUILTIN_PRESETS };
+  let MODEL_ALIASES = { ...BUILTIN_ALIASES };
+
+  async function loadModelCatalog(): Promise<boolean> {
+    try {
+      const raw = JSON.parse(await readFile(MODELS_FILE, "utf-8")) as ModelCatalog;
+      if (raw.presets && typeof raw.presets === "object") {
+        MODEL_PRESETS = raw.presets;
+      }
+      if (raw.aliases && typeof raw.aliases === "object") {
+        MODEL_ALIASES = raw.aliases;
+      }
+      return true;
+    } catch {
+      // File missing or invalid — keep current (builtin) values.
+      return false;
+    }
+  }
+
+  // Try loading from file at startup; fall back to builtins silently.
+  await loadModelCatalog();
+
+  bot.command("model", async (ctx) => {
+    const key = routeKey(routeOf(ctx));
+    const arg = (ctx.match || "").trim().toLowerCase();
+
+    if (arg === "reload") {
+      const ok = await loadModelCatalog();
+      const count = Object.keys(MODEL_PRESETS).length;
+      await replyRouted(
+        ctx,
+        ok
+          ? `🔄 <code>models.json</code> перечитан — ${count} моделей.`
+          : "⚠️ <code>models.json</code> не найден или невалиден — используются встроенные.",
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    if (arg === "reset" || arg === "default" || arg === "auto") {
+      bridge.store.setModel(key, undefined);
+      await replyRouted(ctx, "🔄 Модель сброшена на <b>по умолчанию</b> (SDK default).", { parse_mode: "HTML" });
+      return;
+    }
+
+    if (arg) {
+      const resolved = MODEL_ALIASES[arg] ?? arg;
+      const preset = MODEL_PRESETS[resolved];
+      if (preset) {
+        bridge.store.setModel(key, preset.id);
+        await replyRouted(ctx, `🧠 Модель: <b>${escHtml(preset.label)}</b>\n<code>${escHtml(preset.id)}</code>`, { parse_mode: "HTML" });
+        return;
+      }
+      // Full model ID passed directly
+      if (arg.startsWith("claude-")) {
+        bridge.store.setModel(key, arg);
+        await replyRouted(ctx, `🧠 Модель: <code>${escHtml(arg)}</code>`, { parse_mode: "HTML" });
+        return;
+      }
+      const names = Object.values(MODEL_PRESETS).map((p) => p.label).join(", ");
+      await replyRouted(ctx, `Неизвестная модель: <code>${escHtml(arg)}</code>.\nДоступные: ${escHtml(names)}, auto — или полный ID (claude-…).\n/model reload — перечитать <code>models.json</code>.`, { parse_mode: "HTML" });
+      return;
+    }
+
+    // No argument — show current + picker buttons
+    const state = bridge.threadState(key);
+    const current = state.model
+      ? Object.values(MODEL_PRESETS).find((p) => p.id === state.model)?.label ?? state.model
+      : "по умолчанию";
+    const keyboard = new InlineKeyboard();
+    const entries = Object.entries(MODEL_PRESETS);
+    for (let i = 0; i < entries.length; i++) {
+      const [slug, preset] = entries[i];
+      const mark = state.model === preset.id ? "● " : "";
+      keyboard.text(`${mark}${preset.label}`, `model:${slug}`);
+      if (i % 3 === 2) keyboard.row();
+    }
+    keyboard.row().text(state.model ? "Сброс" : "● Авто", "model:reset");
+    await replyRouted(ctx, `🧠 Модель: <b>${escHtml(current)}</b>`, {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+    });
+  });
+
+  bot.callbackQuery(/^model:/, async (ctx) => {
+    const slug = ctx.callbackQuery.data.slice("model:".length);
+    const key = routeKey(routeOf(ctx));
+    if (slug === "reset") {
+      bridge.store.setModel(key, undefined);
+      await ctx.answerCallbackQuery({ text: "Модель: авто" });
+      await ctx.editMessageText("🧠 Модель: <b>по умолчанию</b>", { parse_mode: "HTML" });
+      return;
+    }
+    const preset = MODEL_PRESETS[slug];
+    if (!preset) {
+      await ctx.answerCallbackQuery({ text: "?" });
+      return;
+    }
+    bridge.store.setModel(key, preset.id);
+    await ctx.answerCallbackQuery({ text: `Модель: ${preset.label}` });
+    await ctx.editMessageText(`🧠 Модель: <b>${escHtml(preset.label)}</b>\n<code>${escHtml(preset.id)}</code>`, { parse_mode: "HTML" });
+  });
+
+  // /speed — thinking budget (speed vs depth)
+  const SPEED_PRESETS: Record<string, { tokens: number | undefined; label: string; emoji: string }> = {
+    fast:   { tokens: 1024,      label: "Быстрый",     emoji: "⚡" },
+    normal: { tokens: undefined,  label: "Нормальный",  emoji: "🔹" },
+    deep:   { tokens: 32768,     label: "Глубокий",     emoji: "🧠" },
+  };
+
+  bot.command("speed", async (ctx) => {
+    const key = routeKey(routeOf(ctx));
+    const arg = (ctx.match || "").trim().toLowerCase();
+
+    if (arg && SPEED_PRESETS[arg]) {
+      const preset = SPEED_PRESETS[arg];
+      bridge.store.setMaxThinkingTokens(key, preset.tokens);
+      await replyRouted(ctx, `${preset.emoji} Скорость: <b>${preset.label}</b>${preset.tokens ? ` (thinking: ${preset.tokens})` : ""}`, { parse_mode: "HTML" });
+      return;
+    }
+    if (arg) {
+      const n = parseInt(arg, 10);
+      if (Number.isFinite(n) && n > 0) {
+        bridge.store.setMaxThinkingTokens(key, n);
+        await replyRouted(ctx, `🎛 maxThinkingTokens = <b>${n}</b>`, { parse_mode: "HTML" });
+        return;
+      }
+      await replyRouted(ctx, "Использование: /speed fast | normal | deep — или число токенов.", { parse_mode: "HTML" });
+      return;
+    }
+
+    // No argument — show current + picker
+    const state = bridge.threadState(key);
+    const currentPreset = Object.entries(SPEED_PRESETS).find(
+      ([, p]) => p.tokens === state.maxThinkingTokens
+    );
+    const currentLabel = currentPreset
+      ? `${currentPreset[1].emoji} ${currentPreset[1].label}`
+      : state.maxThinkingTokens
+        ? `🎛 thinking: ${state.maxThinkingTokens}`
+        : "🔹 Нормальный";
+    const keyboard = new InlineKeyboard();
+    for (const [slug, preset] of Object.entries(SPEED_PRESETS)) {
+      const mark = (state.maxThinkingTokens === preset.tokens) ||
+        (!state.maxThinkingTokens && !preset.tokens) ? "● " : "";
+      keyboard.text(`${mark}${preset.emoji} ${preset.label}`, `speed:${slug}`);
+    }
+    await replyRouted(ctx, `Скорость: <b>${escHtml(currentLabel)}</b>`, {
+      parse_mode: "HTML",
+      reply_markup: keyboard,
+    });
+  });
+
+  bot.callbackQuery(/^speed:/, async (ctx) => {
+    const slug = ctx.callbackQuery.data.slice("speed:".length);
+    const key = routeKey(routeOf(ctx));
+    const preset = SPEED_PRESETS[slug];
+    if (!preset) {
+      await ctx.answerCallbackQuery({ text: "?" });
+      return;
+    }
+    bridge.store.setMaxThinkingTokens(key, preset.tokens);
+    await ctx.answerCallbackQuery({ text: `Скорость: ${preset.label}` });
+    await ctx.editMessageText(`${preset.emoji} Скорость: <b>${preset.label}</b>${preset.tokens ? ` (thinking: ${preset.tokens})` : ""}`, { parse_mode: "HTML" });
+  });
+
   // /mode safe|fast — per-topic confirmation mode for dangerous tools
   bot.command("mode", async (ctx) => {
     const arg = (ctx.match || "").trim().toLowerCase();
@@ -360,16 +581,22 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       bridge.store.setSafeMode(key, true);
       await replyRouted(
         ctx,
-        "🛡 Safe-режим этой вкладки: Bash/Write/Edit — только после подтверждения кнопками."
+        "🛡 <b>Safe</b>-режим: Bash/Write/Edit — только после подтверждения кнопками.",
+        { parse_mode: "HTML" }
       );
     } else if (arg === "fast") {
       bridge.store.setSafeMode(key, false);
-      await replyRouted(ctx, "⚡ Fast-режим этой вкладки: все действия без подтверждений.");
+      await replyRouted(
+        ctx,
+        "⚡ <b>Fast</b>-режим: все действия без подтверждений.",
+        { parse_mode: "HTML" }
+      );
     } else {
       const state = bridge.threadState(key);
       await replyRouted(
         ctx,
-        `Режим этой вкладки: ${state.safeMode ? "🛡 safe" : "⚡ fast"}. Сменить: /mode safe | /mode fast`
+        `Режим вкладки: ${state.safeMode ? "🛡 <b>safe</b>" : "⚡ <b>fast</b>"}. Сменить: /mode safe | /mode fast`,
+        { parse_mode: "HTML" }
       );
     }
   });
@@ -391,7 +618,21 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     bridge.store.setSession(routeKey(routeOf(ctx)), undefined);
     await replyRouted(
       ctx,
-      "Session cleared. Next message here starts a fresh conversation."
+      "Сессия отвязана. Следующее сообщение начнёт <b>новую</b> сессию.",
+      { parse_mode: "HTML" }
+    );
+  });
+
+  // /fresh — next message goes without resume (new session), but the old
+  // session stays available via /sessions. Useful when the session history
+  // is too large for the context window.
+  bot.command("fresh", async (ctx) => {
+    const key = routeKey(routeOf(ctx));
+    bridge.store.setFreshNext(key, true);
+    await replyRouted(
+      ctx,
+      "Следующее сообщение пойдёт <b>без истории</b> (новая сессия).\nСтарая сессия останется в /sessions.",
+      { parse_mode: "HTML" }
     );
   });
 
@@ -399,21 +640,21 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   bot.command("projects", async (ctx) => {
     const projects = await listProjects();
     if (projects.length === 0) {
-      await replyRouted(ctx, "No projects found in ~/.claude/projects/");
+      await replyRouted(ctx, "Проекты не найдены.");
       return;
     }
 
     const lines = projects.slice(0, 20).map(
-      (p, i) => `${i + 1}. **${p.name}** (${formatRelativeTime(p.lastActivity)})\n   \`${p.path}\``
+      (p, i) => `${i + 1}. <b>${escHtml(p.name)}</b> (${formatRelativeTime(p.lastActivity)})\n   <code>${escHtml(p.path)}</code>`
     );
-    await replyRouted(ctx, lines.join("\n"), { parse_mode: "Markdown" });
+    await replyRouted(ctx, lines.join("\n"), { parse_mode: "HTML" });
   });
 
   // /switch command — show project picker for the current topic
   bot.command("switch", async (ctx) => {
     const projects = await listProjects();
     if (projects.length === 0) {
-      await replyRouted(ctx, "No projects found in ~/.claude/projects/");
+      await replyRouted(ctx, "Проекты не найдены.");
       return;
     }
 
@@ -427,7 +668,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         .row();
     }
 
-    await replyRouted(ctx, "Pick a project:", { reply_markup: keyboard });
+    await replyRouted(ctx, "Выберите проект:", { reply_markup: keyboard });
   });
 
   // Handle inline keyboard callbacks for project switching
@@ -439,10 +680,10 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     const name = baseName(projectPath);
     await ctx.answerCallbackQuery();
     const sessionNote = resumedId
-      ? `Resumed session \`${resumedId.slice(0, 8)}...\``
-      : "Starting fresh session.";
-    await ctx.editMessageText(`Switched to **${name}**\n\`${projectPath}\`\n\n${sessionNote}`, {
-      parse_mode: "Markdown",
+      ? `Продолжена сессия <code>${resumedId.slice(0, 8)}…</code>`
+      : "Начнётся новая сессия.";
+    await ctx.editMessageText(`Переключено на <b>${escHtml(name)}</b>\n<code>${escHtml(projectPath)}</code>\n\n${sessionNote}`, {
+      parse_mode: "HTML",
     });
   });
 
@@ -490,8 +731,8 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
     const text =
       sessions.length > SESSIONS_PAGE
-        ? `Pick a session (${safeOffset + 1}–${Math.min(safeOffset + SESSIONS_PAGE, sessions.length)} of ${sessions.length}):`
-        : "Pick a session to resume:";
+        ? `Выберите сессию (${safeOffset + 1}–${Math.min(safeOffset + SESSIONS_PAGE, sessions.length)} из ${sessions.length}):`
+        : "Выберите сессию:";
     return { text, keyboard };
   }
 
@@ -503,8 +744,8 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       const state = bridge.threadState(key);
       await replyRouted(
         ctx,
-        `No sessions found for \`${state.projectPath}\``,
-        { parse_mode: "Markdown" }
+        `Сессий не найдено для <code>${escHtml(state.projectPath)}</code>`,
+        { parse_mode: "HTML" }
       );
       return;
     }
@@ -544,10 +785,11 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       const name = await topicLabelOf(other, id);
       await ctx.answerCallbackQuery();
       await ctx.editMessageText(
-        `Session is already open in topic «${name}» — continue there, or take it over:`,
+        `Сессия уже открыта во вкладке «${escHtml(name)}» — продолжить там или забрать сюда:`,
         {
+          parse_mode: "HTML",
           reply_markup: new InlineKeyboard().text(
-            "Take over here",
+            "Забрать сюда",
             `resume!:${id}`
           ),
         }
@@ -558,11 +800,11 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     bridge.store.bindSession(key, id);
     const state = bridge.store.get(key);
     const title = await getSessionTitle(state.projectPath, id);
-    const label = title ? `**${title}**` : `\`${id.slice(0, 8)}...\``;
+    const label = title ? `<b>${escHtml(title)}</b>` : `<code>${id.slice(0, 8)}…</code>`;
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
-      `Resumed ${label}\nNext message here continues it.`,
-      { parse_mode: "Markdown" }
+      `Продолжена ${label}\nСледующее сообщение продолжит эту сессию.`,
+      { parse_mode: "HTML" }
     );
     if (ctx.chat) await bridge.syncTopicTitle(ctx.chat.id, routeOf(ctx));
   });
@@ -579,11 +821,11 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
     const state = bridge.store.get(key);
     const title = await getSessionTitle(state.projectPath, id);
-    const label = title ? `**${title}**` : `\`${id.slice(0, 8)}...\``;
+    const label = title ? `<b>${escHtml(title)}</b>` : `<code>${id.slice(0, 8)}…</code>`;
     await ctx.answerCallbackQuery();
     await ctx.editMessageText(
-      `Resumed ${label} (taken over)\nNext message here continues it.`,
-      { parse_mode: "Markdown" }
+      `Продолжена ${label} (забрана)\nСледующее сообщение продолжит эту сессию.`,
+      { parse_mode: "HTML" }
     );
     if (ctx.chat) await bridge.syncTopicTitle(ctx.chat.id, routeOf(ctx));
   });
@@ -594,8 +836,8 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     if (!arg) {
       await replyRouted(
         ctx,
-        "Usage: `/resume <session-id>` — or `/sessions` to pick from a list.",
-        { parse_mode: "Markdown" }
+        "Использование: /resume <code>&lt;session-id&gt;</code> — или /sessions для выбора из списка.",
+        { parse_mode: "HTML" }
       );
       return;
     }
@@ -607,8 +849,8 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     if (!match) {
       await replyRouted(
         ctx,
-        `No session matching \`${arg}\` in this project. Use /sessions to list.`,
-        { parse_mode: "Markdown" }
+        `Сессия <code>${escHtml(arg)}</code> не найдена. /sessions — список.`,
+        { parse_mode: "HTML" }
       );
       return;
     }
@@ -618,10 +860,11 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       const name = await topicLabelOf(other, match.id);
       await replyRouted(
         ctx,
-        `Session is already open in topic «${name}» — continue there, or take it over:`,
+        `Сессия уже открыта во вкладке «${escHtml(name)}» — продолжить там или забрать сюда:`,
         {
+          parse_mode: "HTML",
           reply_markup: new InlineKeyboard().text(
-            "Take over here",
+            "Забрать сюда",
             `resume!:${match.id}`
           ),
         }
@@ -631,10 +874,10 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
     bridge.store.bindSession(key, match.id);
     const label = match.title
-      ? `**${match.title}**`
-      : `\`${match.id.slice(0, 8)}...\``;
-    await replyRouted(ctx, `Resumed ${label}. Next message here continues it.`, {
-      parse_mode: "Markdown",
+      ? `<b>${escHtml(match.title)}</b>`
+      : `<code>${match.id.slice(0, 8)}…</code>`;
+    await replyRouted(ctx, `Продолжена ${label}. Следующее сообщение продолжит эту сессию.`, {
+      parse_mode: "HTML",
     });
     await bridge.syncTopicTitle(ctx.chat.id, routeOf(ctx));
   });
@@ -665,7 +908,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     if (!state.sessionId) {
       await replyRouted(
         ctx,
-        "No session attached yet. Send a message, or pick one via /sessions."
+        "Сессия не привязана. Отправьте сообщение или выберите через /sessions."
       );
       return;
     }
@@ -678,7 +921,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         Number.MAX_SAFE_INTEGER
       );
       if (messages.length === 0) {
-        await replyRouted(ctx, "Session log is empty or not found on disk.");
+        await replyRouted(ctx, "Лог сессии пуст или не найден.");
         return;
       }
       const title = await getSessionTitle(state.projectPath, state.sessionId);
@@ -710,12 +953,12 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       limit
     );
     if (messages.length === 0) {
-      await replyRouted(ctx, "Session log is empty or not found on disk.");
+      await replyRouted(ctx, "Лог сессии пуст или не найден.");
       return;
     }
 
     const title = await getSessionTitle(state.projectPath, state.sessionId);
-    const header = `History of ${title || state.sessionId.slice(0, 8)} — last ${messages.length} message(s):`;
+    const header = `История ${title || state.sessionId.slice(0, 8)} — последние ${messages.length}:`;
 
     // Session text is arbitrary, so no parse_mode (Markdown would break),
     // long messages are cut and the whole thing is chunked under Telegram's
@@ -756,8 +999,8 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     if (!name) {
       await replyRouted(
         ctx,
-        "Usage: `/rename <новое имя>` — переименовать сессию этой вкладки.",
-        { parse_mode: "Markdown" }
+        "Использование: /rename <code>&lt;новое имя&gt;</code> — переименовать сессию этой вкладки.",
+        { parse_mode: "HTML" }
       );
       return;
     }
@@ -766,14 +1009,14 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     if (!state.sessionId) {
       await replyRouted(
         ctx,
-        "No session attached yet. Send a message, or pick one via /sessions."
+        "Сессия не привязана. Отправьте сообщение или выберите через /sessions."
       );
       return;
     }
 
     await setSessionTitle(state.projectPath, state.sessionId, name);
     await bridge.syncTopicTitle(ctx.chat.id, routeOf(ctx));
-    await replyRouted(ctx, `Renamed to «${name}».`);
+    await replyRouted(ctx, `Переименовано в «${escHtml(name)}».`, { parse_mode: "HTML" });
   });
 
   // /get <path> — send a file from the project (or an absolute path) to chat
@@ -782,8 +1025,8 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     if (!arg) {
       await replyRouted(
         ctx,
-        "Usage: `/get <путь>` — файл из проекта (относительный) или абсолютный путь.",
-        { parse_mode: "Markdown" }
+        "Использование: /get <code>&lt;путь&gt;</code> — файл из проекта (относительный) или абсолютный.",
+        { parse_mode: "HTML" }
       );
       return;
     }
@@ -792,7 +1035,11 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     const filePath = isAbsolute(arg) ? arg : join(state.projectPath, arg);
     const info = await stat(filePath).catch(() => null);
     if (!info || !info.isFile()) {
-      await replyRouted(ctx, `Файл не найден: ${filePath}`);
+      await replyRouted(
+        ctx,
+        `Файл не найден: <code>${escHtml(filePath)}</code>`,
+        { parse_mode: "HTML" }
+      );
       return;
     }
     if (info.size > 50 * 1024 * 1024) {
@@ -820,7 +1067,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
       return;
     }
     if (!file.file_path) {
-      await replyRouted(ctx, "Could not download file.");
+      await replyRouted(ctx, "Не удалось скачать файл.");
       return;
     }
 
@@ -852,7 +1099,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     const file = await ctx.api.getFile(largest.file_id);
 
     if (!file.file_path) {
-      await replyRouted(ctx, "Could not download image.");
+      await replyRouted(ctx, "Не удалось скачать изображение.");
       return;
     }
 
@@ -887,23 +1134,27 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     await bridge.syncTopicTitle(ctx.chat.id, extractRoute(ctx.message));
   });
 
-  // Command menu with autocomplete — also guards against typos like /session
+  // Command menu — sorted alphabetically for Telegram autocomplete.
   await bot.api.setMyCommands([
-    { command: "status", description: "Проект и сессия этой вкладки" },
-    { command: "stop", description: "Прервать текущую задачу" },
-    { command: "sessions", description: "Выбрать сессию для этой вкладки" },
-    { command: "resume", description: "Привязать сессию по id" },
-    { command: "history", description: "Последние сообщения сессии (all — файлом)" },
-    { command: "rename", description: "Переименовать сессию и вкладку" },
+    { command: "fresh", description: "Следующее сообщение без истории (новая сессия)" },
     { command: "get", description: "Прислать файл из проекта" },
+    { command: "help", description: "Справка по командам и вкладкам" },
+    { command: "history", description: "Последние сообщения сессии (all — файлом)" },
+    { command: "lock", description: "Заблокировать бота (если задан пароль)" },
+    { command: "mode", description: "Режим: safe (с подтверждениями) | fast" },
+    { command: "model", description: "Модель: fable, opus, sonnet, haiku" },
     { command: "new", description: "Свежая сессия в этой вкладке" },
     { command: "projects", description: "Список проектов" },
-    { command: "switch", description: "Сменить проект вкладки" },
-    { command: "mode", description: "Режим вкладки: safe (с подтверждениями) | fast" },
-    { command: "lock", description: "Заблокировать бота (если задан пароль)" },
-    { command: "help", description: "Справка по командам и вкладкам" },
+    { command: "rename", description: "Переименовать сессию и вкладку" },
     { command: "restart", description: "Перезапустить бота" },
+    { command: "resume", description: "Привязать сессию по id" },
+    { command: "sessions", description: "Выбрать сессию для этой вкладки" },
     { command: "shutdown", description: "Выключить бота" },
+    { command: "speed", description: "Скорость: fast, normal, deep" },
+    { command: "status", description: "Проект и сессия этой вкладки" },
+    { command: "stop", description: "Прервать текущую задачу" },
+    { command: "switch", description: "Сменить проект вкладки" },
+    { command: "unlock", description: "Разблокировать вкладку (пароль)" },
   ]);
 
   // Confirm a /restart to the topic that requested it.

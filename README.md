@@ -9,7 +9,7 @@
   <p align="center">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
     <img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg" alt="Node >= 18">
-    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg" alt="macOS | Linux">
+    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg" alt="Windows | macOS | Linux">
   </p>
 </p>
 
@@ -150,12 +150,21 @@ Start a fresh conversation anytime with `/new`.
 ## Features
 
 - **Full Claude Code agent** — Read, Edit, Write, Bash, Glob, Grep, WebSearch, WebFetch, and Task (subagents)
-- **Streaming responses** — messages update live on Telegram as Claude thinks
-- **Seamless handoff** — auto-resumes your latest Claude Code session, pick up on Telegram where you left off in VS Code
+- **Streaming responses** — plain text while streaming; Markdown→HTML conversion at finalize (tables, code blocks, bold, links)
+- **Mobile-friendly tables** — wide tables render as vertical cards; narrow tables as `<pre>` blocks
+- **Seamless handoff** — auto-resumes your latest Claude Code session; pick up on Telegram where you left off in VS Code
+- **Topics as sessions** — each Telegram chat tab is an independent session with its own project, model, speed and lock state
+- **Model picker** — switch between Claude models per tab (`/model`); presets in `models.json`, hot-reloadable
+- **Speed control** — adjust thinking budget per tab (`/speed fast|normal|deep` or a custom token count)
+- **Auto-retry on context overflow** — if a resumed session is too large, the bot retries without history automatically
+- **`/fresh` one-shot** — send the next message without history when you know the session is huge
+- **Safe mode** — per-tab opt-in confirmation buttons for Bash/Write/Edit (`/mode safe`)
+- **Password lock** — per-tab password gate with brute-force protection (`VIBEIDE_PASSWORD_HASH`)
+- **Activity indicator** — tab name shows ⚙️ while the agent is working
 - **Project switching** — jump between any project in `~/.claude/projects/` without restarting
 - **Image support** — send photos, screenshots, diagrams for Claude to analyze
-- **Long response splitting** — auto-splits at ~3800 chars, well under Telegram's 4096 limit
-- **Markdown rendering** — code blocks, bold, inline code, with plain-text fallback
+- **File transfer** — `/get <path>` sends files from the project; documents sent to the bot go to the agent
+- **Message queue** — up to 5 messages queued while the agent is busy
 - **Single user auth** — only your Telegram account can talk to the bot
 - **Zero infrastructure** — single local process, no server, no database, no open ports
 - **Any Telegram client** — works from phone, tablet, desktop app, or web browser
@@ -174,16 +183,48 @@ Start a fresh conversation anytime with `/new`.
                        Markdown + fallback             Session resume via session_id
 ```
 
-Single process. ~300 lines of TypeScript. No moving parts.
+Single process. No moving parts.
 
 ## Commands
 
-| Command     | What it does                                                   |
-| ----------- | -------------------------------------------------------------- |
-| `/projects` | List your recent Claude Code projects, sorted by last activity |
-| `/switch`   | Change active project via inline keyboard picker               |
-| `/new`      | Start a fresh conversation (same project, clears session)      |
-| `/status`   | Show current project path and session info                     |
+Every chat tab (topic) is an independent Claude Code session.
+
+**Session**
+
+| Command | What it does |
+| --- | --- |
+| `/fresh` | Next message starts a **new session** (old one stays in `/sessions`) |
+| `/history [n\|all]` | Last *n* messages, or full session as a text file |
+| `/new` | Unbind session — next message starts fresh |
+| `/rename <name>` | Rename session and the Telegram tab |
+| `/resume <id>` | Bind a session by ID (first 8 chars are enough) |
+| `/sessions` | Pick a session from a paged inline keyboard |
+| `/status` | Current project, tab key and session |
+
+**Project**
+
+| Command | What it does |
+| --- | --- |
+| `/get <path>` | Send a file from the project to chat |
+| `/projects` | List recent Claude Code projects |
+| `/switch` | Change this tab's project via inline keyboard |
+
+**Model & Speed**
+
+| Command | What it does |
+| --- | --- |
+| `/model [name]` | Pick a model: fable, opus, sonnet, haiku — or a full ID (`claude-…`). Buttons when called without args. `/model reload` re-reads `models.json` without restart |
+| `/speed [preset]` | Thinking budget: `fast` · `normal` · `deep` — or a token count. Buttons when called without args |
+
+**Control**
+
+| Command | What it does |
+| --- | --- |
+| `/lock` / `/unlock <pw>` | Lock/unlock the bot (per-tab, when `VIBEIDE_PASSWORD_HASH` is set) |
+| `/mode safe\|fast` | Safe = confirm Bash/Write/Edit with buttons; fast = no confirmations |
+| `/restart` | Restart the bot process |
+| `/shutdown` | Shut down the bot |
+| `/stop` | Abort current task and clear the queue |
 
 Everything else you type — text or photos — is sent directly to Claude.
 
@@ -206,10 +247,13 @@ vibeide/
 ├── app/src/
 │   ├── index.ts        # Entry point, CLI args, startup
 │   ├── config.ts       # Env loading + validation
-│   ├── bot.ts          # Grammy bot, auth, commands, photo handling
-│   ├── bridge.ts       # Claude Agent SDK wrapper, session management
-│   ├── streamer.ts     # Streaming responses → Telegram with throttling
-│   └── projects.ts     # Project discovery from ~/.claude/projects/
+│   ├── bot.ts          # Grammy bot, commands, auth, password lock
+│   ├── bridge.ts       # Claude Agent SDK wrapper, session/queue/safe-mode
+│   ├── streamer.ts     # Streaming → Telegram, Markdown→HTML at finalize
+│   ├── topics.ts       # Per-topic state persistence (topics.json)
+│   └── projects.ts     # Project/session discovery from ~/.claude/projects/
+├── models.json         # Model presets (hot-reloadable via /model reload)
+├── topics.json         # Per-tab state: project, session, model, speed, mode
 ├── package.json
 ├── tsconfig.json
 ├── .env.example
@@ -223,8 +267,12 @@ vibeide/
 | `TELEGRAM_BOT_TOKEN`       | `.env`    | Yes | Bot token from [@BotFather](https://t.me/BotFather)                         |
 | `TELEGRAM_ALLOWED_USER_ID` | `.env`    | Yes | Your numeric Telegram ID (message [@userinfobot](https://t.me/userinfobot)) |
 | `ANTHROPIC_API_KEY`        | `.env`    | No  | Only needed for API billing. If you're on Claude Pro/Max, the SDK uses your existing `claude login` session automatically. |
+| `VIBEIDE_PASSWORD_HASH`    | `.env`    | No  | SHA-256 hex of an access password. When set, every tab must `/unlock` before use. |
+| `VIBEIDE_AUTOLOCK_MIN`     | `.env`    | No  | Auto-lock timeout in minutes (default 60). Resets on each message. |
 
 The project path is passed as a CLI argument. If omitted, VibeIDE uses the current working directory.
+
+**`models.json`** (optional, next to `topics.json`) — model presets and aliases used by `/model`. Edit the file and run `/model reload` to add new models without restarting the bot.
 
 ## Security
 
