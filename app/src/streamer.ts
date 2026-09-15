@@ -1,4 +1,5 @@
 import type { Api, RawApi } from "grammy";
+import { sendRouted, type ThreadRoute } from "./topics.js";
 
 const EDIT_INTERVAL_MS = 300;
 const MAX_MESSAGE_LENGTH = 3800; // Leave room for formatting overhead under 4096 limit
@@ -6,6 +7,7 @@ const MAX_MESSAGE_LENGTH = 3800; // Leave room for formatting overhead under 409
 export class Streamer {
   private api: Api<RawApi>;
   private chatId: number;
+  private route: ThreadRoute;
   private text = "";
   private messageId: number | null = null;
   private lastEditTime = 0;
@@ -13,9 +15,10 @@ export class Streamer {
   private finalized = false;
   private sentMessages: number[] = [];
 
-  constructor(api: Api<RawApi>, chatId: number) {
+  constructor(api: Api<RawApi>, chatId: number, route: ThreadRoute = {}) {
     this.api = api;
     this.chatId = chatId;
+    this.route = route;
   }
 
   async append(delta: string): Promise<void> {
@@ -56,17 +59,15 @@ export class Streamer {
   private async sendInitial(): Promise<void> {
     const content = this.text || "...";
     try {
-      const msg = await this.api.sendMessage(
-        this.chatId,
-        content,
-        { parse_mode: "Markdown" }
-      );
+      const msg = await sendRouted(this.api, this.chatId, content, this.route, {
+        parse_mode: "Markdown",
+      });
       this.messageId = msg.message_id;
       this.lastEditTime = Date.now();
     } catch {
       // Markdown failed, try plain text
       try {
-        const msg = await this.api.sendMessage(this.chatId, content);
+        const msg = await sendRouted(this.api, this.chatId, content, this.route);
         this.messageId = msg.message_id;
         this.lastEditTime = Date.now();
       } catch (e) {

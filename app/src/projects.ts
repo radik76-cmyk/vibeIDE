@@ -1,4 +1,4 @@
-import { readdir, stat, readFile } from "fs/promises";
+import { readdir, stat, readFile, writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
 
@@ -177,6 +177,27 @@ async function resolveSessionTitle(
   return undefined;
 }
 
+// Set the user-visible session title — the same custom-title.json the
+// Claude Code terminal maintains, so the name shows up in both places.
+export async function setSessionTitle(
+  projectPath: string,
+  id: string,
+  title: string
+): Promise<void> {
+  const dir = join(PROJECTS_DIR, encodePath(projectPath), id);
+  await mkdir(dir, { recursive: true });
+  const file = join(dir, "custom-title.json");
+  let data: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(await readFile(file, "utf-8"));
+    if (parsed && typeof parsed === "object") data = parsed;
+  } catch {
+    // no file yet or malformed — start clean
+  }
+  data.customTitle = title;
+  await writeFile(file, JSON.stringify(data), "utf-8");
+}
+
 // Title for a single known session id (used by /status, /resume).
 export async function getSessionTitle(
   projectPath: string,
@@ -210,6 +231,59 @@ export async function listSessions(projectPath: string): Promise<SessionInfo[]> 
 
   sessions.sort((a, b) => b.lastActivity.getTime() - a.lastActivity.getTime());
   return sessions;
+}
+
+export interface SessionMessage {
+  role: "user" | "assistant";
+  text: string;
+}
+
+// Last text messages of a session's main conversation: user and assistant
+// records with visible text. Skips tool results (no text blocks), meta
+// records, subagent sidechains and injected <system-reminder> blocks.
+// Returns up to `limit` messages, oldest first.
+export async function readSessionMessages(
+  projectPath: string,
+  id: string,
+  limit: number
+): Promise<SessionMessage[]> {
+  const projectDir = join(PROJECTS_DIR, encodePath(projectPath));
+  let content: string;
+  try {
+    content = await readFile(join(projectDir, `${id}.jsonl`), "utf-8");
+  } catch {
+    return [];
+  }
+
+  const messages: SessionMessage[] = [];
+  for (const line of content.split("\n")) {
+    if (!line) continue;
+    let rec: any;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue; // skip malformed line
+    }
+    if (rec?.type !== "user" && rec?.type !== "assistant") continue;
+    if (rec.isMeta || rec.isSidechain) continue;
+    const msgContent = rec.message?.content;
+    let text = "";
+    if (typeof msgContent === "string") {
+      text = msgContent;
+    } else if (Array.isArray(msgContent)) {
+      const parts: string[] = [];
+      for (const block of msgContent) {
+        if (block?.type !== "text" || !block.text) continue;
+        if (block.text.startsWith("<system-reminder>")) continue;
+        parts.push(block.text);
+      }
+      text = parts.join("\n");
+    }
+    text = text.trim();
+    if (!text) continue;
+    messages.push({ role: rec.type, text });
+  }
+  return messages.slice(-limit);
 }
 
 export function formatRelativeTime(date: Date): string {

@@ -1,43 +1,87 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Api, RawApi } from "grammy";
 import { Streamer } from "./streamer.js";
-import { findLatestSessionId } from "./projects.js";
+import { findLatestSessionId, getSessionTitle } from "./projects.js";
+import {
+  ThreadStore,
+  routeKey,
+  sendRouted,
+  type ThreadRoute,
+} from "./topics.js";
 
 export class Bridge {
-  projectPath: string;
-  sessionId: string | undefined;
-  private isProcessing = false;
+  store: ThreadStore;
+  private busy = new Set<string>();
   private api: Api<RawApi>;
 
   constructor(api: Api<RawApi>, projectPath?: string) {
     this.api = api;
-    this.projectPath = projectPath || process.cwd();
+    this.store = new ThreadStore(projectPath || process.cwd());
   }
 
-  async resumeLatestSession(): Promise<string | undefined> {
-    this.sessionId = await findLatestSessionId(this.projectPath);
-    return this.sessionId;
+  // Attach the latest session of the thread's project to that thread.
+  async resumeLatest(key: string): Promise<string | undefined> {
+    const state = this.store.get(key);
+    const sessionId = await findLatestSessionId(state.projectPath);
+    this.store.setSession(key, sessionId);
+    return sessionId;
   }
 
-  clearSession(): void {
-    this.sessionId = undefined;
+  // Thread state with legacy-main adoption applied (see ThreadStore.adoptMain).
+  threadState(key: string) {
+    this.store.adoptMain(key);
+    return this.store.get(key);
+  }
+
+  // Best-effort: name the topic after its session so tabs are recognizable.
+  // Telegram auto-creates topics as "Новый чат"; once the session has a
+  // title (custom or ai-generated), the tab takes it.
+  async syncTopicTitle(chatId: number, route: ThreadRoute): Promise<void> {
+    const key = routeKey(route);
+    if (key === "main") return;
+    const state = this.store.get(key);
+    if (!state.sessionId) return;
+    const title = await getSessionTitle(state.projectPath, state.sessionId);
+    if (!title || title === state.title) return;
+    const name = title.length > 128 ? title.slice(0, 127) + "…" : title;
+    const ids = [
+      ...new Set(
+        [route.directMessagesTopicId, route.messageThreadId].filter(
+          (v): v is number => v !== undefined
+        )
+      ),
+    ];
+    for (const id of ids) {
+      try {
+        await this.api.editForumTopic(chatId, id, { name });
+        this.store.setTitle(key, title);
+        return;
+      } catch {
+        // wrong id kind or no rights — try the other id, else give up
+      }
+    }
   }
 
   async sendMessage(
     chatId: number,
     text: string,
+    route: ThreadRoute = {},
     images?: { data: string; mediaType: string }[]
   ): Promise<void> {
-    if (this.isProcessing) {
-      await this.api.sendMessage(
+    const key = routeKey(route);
+    if (this.busy.has(key)) {
+      await sendRouted(
+        this.api,
         chatId,
-        "Still thinking on your last message... please wait."
+        "Still thinking on your last message... please wait.",
+        route
       );
       return;
     }
 
-    this.isProcessing = true;
-    const streamer = new Streamer(this.api, chatId);
+    this.busy.add(key);
+    const state = this.threadState(key);
+    const streamer = new Streamer(this.api, chatId, route);
 
     try {
       let promptInput: any;
@@ -77,8 +121,8 @@ export class Bridge {
       const conversation = query({
         prompt: promptInput,
         options: {
-          cwd: this.projectPath,
-          ...(this.sessionId ? { resume: this.sessionId } : {}),
+          cwd: state.projectPath,
+          ...(state.sessionId ? { resume: state.sessionId } : {}),
           allowedTools: [
             "Read",
             "Edit",
@@ -100,7 +144,9 @@ export class Bridge {
       for await (const message of conversation) {
         // Capture session ID from any message
         if ("session_id" in message && message.session_id) {
-          this.sessionId = message.session_id;
+          if (state.sessionId !== message.session_id) {
+            this.store.setSession(key, message.session_id);
+          }
         }
 
         if (message.type === "assistant" && message.message) {
@@ -128,7 +174,7 @@ export class Bridge {
       await streamer.append(`\n\nBridge error: ${err.message || err}`);
     } finally {
       await streamer.finalize();
-      this.isProcessing = false;
+      this.busy.delete(key);
     }
   }
 }
