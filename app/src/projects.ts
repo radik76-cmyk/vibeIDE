@@ -1,4 +1,4 @@
-import { readdir, stat } from "fs/promises";
+import { readdir, stat, readFile } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
 
@@ -11,8 +11,47 @@ export interface ProjectInfo {
 
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
 
-function decodePath(encoded: string): string {
-  return encoded.replace(/-/g, "/");
+// Claude Code names each project folder by taking the project's cwd and
+// replacing every character that is not a letter or digit with "-".
+// On Windows that collapses ":", "\", "/", "!" and "_" all into "-", so the
+// original path CANNOT be reconstructed from the folder name alone (lossy).
+// Therefore the real path is read back from the "cwd" field stored inside the
+// session .jsonl records; encoding (path -> folder) stays deterministic and is
+// used to locate a project's folder from a known path.
+function encodePath(projectPath: string): string {
+  return projectPath.replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+// Last path segment of a Windows or POSIX path, for display.
+function baseName(p: string): string {
+  return p.split(/[\\/]/).filter(Boolean).pop() || p;
+}
+
+// Read the real cwd from the newest session files of a project folder.
+// Scans newest-first, line-by-line, stopping at the first record that carries
+// a non-empty "cwd". Returns undefined when no session records a cwd.
+async function readProjectCwd(
+  projectDir: string,
+  jsonlNewestFirst: string[]
+): Promise<string | undefined> {
+  for (const file of jsonlNewestFirst) {
+    let content: string;
+    try {
+      content = await readFile(join(projectDir, file), "utf-8");
+    } catch {
+      continue;
+    }
+    for (const line of content.split("\n")) {
+      if (!line || !line.includes('"cwd"')) continue; // cheap prefilter
+      try {
+        const rec = JSON.parse(line);
+        if (rec && typeof rec.cwd === "string" && rec.cwd) return rec.cwd;
+      } catch {
+        // skip malformed line
+      }
+    }
+  }
+  return undefined;
 }
 
 export async function listProjects(): Promise<ProjectInfo[]> {
@@ -30,41 +69,43 @@ export async function listProjects(): Promise<ProjectInfo[]> {
     const dirStat = await stat(projectDir).catch(() => null);
     if (!dirStat?.isDirectory()) continue;
 
-    const decodedPath = decodePath(entry);
-    const name = decodedPath.split("/").filter(Boolean).pop() || entry;
-
-    // Find most recent .jsonl file for last activity
-    let lastActivity = dirStat.mtime;
+    // Collect .jsonl files with their mtimes to get both the newest-first order
+    // (for cwd lookup) and the last-activity timestamp in one pass.
+    let jsonl: { file: string; mtime: number }[] = [];
     try {
       const files = await readdir(projectDir);
       for (const file of files) {
         if (!file.endsWith(".jsonl")) continue;
         const fileStat = await stat(join(projectDir, file)).catch(() => null);
-        if (fileStat && fileStat.mtime > lastActivity) {
-          lastActivity = fileStat.mtime;
-        }
+        if (fileStat) jsonl.push({ file, mtime: fileStat.mtimeMs });
       }
     } catch {
       // ignore read errors
     }
+    jsonl.sort((a, b) => b.mtime - a.mtime);
 
-    projects.push({
-      name,
-      path: decodedPath,
-      encodedName: entry,
-      lastActivity,
-    });
+    const lastActivity =
+      jsonl.length > 0 ? new Date(jsonl[0].mtime) : dirStat.mtime;
+
+    const cwd = await readProjectCwd(
+      projectDir,
+      jsonl.map((j) => j.file)
+    );
+    // Fall back to the folder name when no session recorded a cwd (the folder
+    // name is lossy but better than nothing for display).
+    const path = cwd || entry;
+    const name = baseName(path);
+
+    projects.push({ name, path, encodedName: entry, lastActivity });
   }
 
   projects.sort((a, b) => b.lastActivity.getTime() - a.lastActivity.getTime());
   return projects;
 }
 
-function encodePath(projectPath: string): string {
-  return projectPath.replace(/\//g, "-");
-}
-
-export async function findLatestSessionId(projectPath: string): Promise<string | undefined> {
+export async function findLatestSessionId(
+  projectPath: string
+): Promise<string | undefined> {
   const encoded = encodePath(projectPath);
   const projectDir = join(PROJECTS_DIR, encoded);
 
@@ -89,6 +130,86 @@ export async function findLatestSessionId(projectPath: string): Promise<string |
 
   if (!latestFile) return undefined;
   return latestFile.replace(".jsonl", "");
+}
+
+export interface SessionInfo {
+  id: string;
+  title?: string;
+  lastActivity: Date;
+}
+
+// Human-readable name for a session, best-effort:
+//   1) the user-set title in <projectDir>/<id>/custom-title.json,
+//   2) the auto-generated "aiTitle" from the session .jsonl (last occurrence),
+//   otherwise undefined (caller falls back to the short id).
+async function resolveSessionTitle(
+  projectDir: string,
+  id: string
+): Promise<string | undefined> {
+  try {
+    const raw = await readFile(
+      join(projectDir, id, "custom-title.json"),
+      "utf-8"
+    );
+    const t = JSON.parse(raw)?.customTitle;
+    if (typeof t === "string" && t.trim()) return t.trim();
+  } catch {
+    // no custom title
+  }
+  try {
+    const content = await readFile(join(projectDir, `${id}.jsonl`), "utf-8");
+    let ai: string | undefined;
+    for (const line of content.split("\n")) {
+      if (!line.includes('"aiTitle"')) continue; // cheap prefilter
+      try {
+        const rec = JSON.parse(line);
+        if (rec && typeof rec.aiTitle === "string" && rec.aiTitle.trim()) {
+          ai = rec.aiTitle.trim(); // keep the latest one
+        }
+      } catch {
+        // skip malformed line
+      }
+    }
+    if (ai) return ai;
+  } catch {
+    // no session log
+  }
+  return undefined;
+}
+
+// Title for a single known session id (used by /status, /resume).
+export async function getSessionTitle(
+  projectPath: string,
+  id: string
+): Promise<string | undefined> {
+  const projectDir = join(PROJECTS_DIR, encodePath(projectPath));
+  return resolveSessionTitle(projectDir, id);
+}
+
+// List all sessions of a project (newest first) with names, for /sessions and /resume.
+export async function listSessions(projectPath: string): Promise<SessionInfo[]> {
+  const encoded = encodePath(projectPath);
+  const projectDir = join(PROJECTS_DIR, encoded);
+
+  let files: string[];
+  try {
+    files = await readdir(projectDir);
+  } catch {
+    return [];
+  }
+
+  const sessions: SessionInfo[] = [];
+  for (const file of files) {
+    if (!file.endsWith(".jsonl")) continue;
+    const fileStat = await stat(join(projectDir, file)).catch(() => null);
+    if (!fileStat) continue;
+    const id = file.replace(".jsonl", "");
+    const title = await resolveSessionTitle(projectDir, id);
+    sessions.push({ id, title, lastActivity: new Date(fileStat.mtimeMs) });
+  }
+
+  sessions.sort((a, b) => b.lastActivity.getTime() - a.lastActivity.getTime());
+  return sessions;
 }
 
 export function formatRelativeTime(date: Date): string {
