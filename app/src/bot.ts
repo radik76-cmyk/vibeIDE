@@ -35,6 +35,33 @@ function sanitizeFileName(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, "_").slice(0, 120) || "file";
 }
 
+// Optimal string alignment distance (Levenshtein + adjacent transposition).
+function osaDistance(a: string, b: string): number {
+  const d: number[][] = Array.from({ length: a.length + 1 }, (_, i) =>
+    Array.from({ length: b.length + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      }
+    }
+  }
+  return d[a.length][b.length];
+}
+
+// A mistyped /unlock must still be recognized — otherwise the password
+// stays visible in the chat next to the typo. First token, slash and
+// @botname stripped, within one edit of "unlock". Exported for tests.
+export function looksLikeUnlockAttempt(text: string): boolean {
+  const first = text.trim().split(/\s+/)[0] ?? "";
+  const word = first.replace(/^\//, "").replace(/@\w+$/, "").toLowerCase();
+  if (word.length < 4) return false;
+  return osaDistance(word, "unlock") <= 1;
+}
+
 // Telegram inline-button labels are short; keep names readable.
 function shorten(s: string, max = 40): string {
   return s.length > max ? s.slice(0, max - 1) + "…" : s;
@@ -131,12 +158,16 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     const now = Date.now();
     const text = ctx.message?.text ?? "";
 
-    if (/^\/unlock(@\w+)?(\s|$)/.test(text)) {
-      const password = text.replace(/^\/unlock(@\w+)?\s*/, "");
+    if (looksLikeUnlockAttempt(text)) {
+      const password = text.trim().split(/\s+/).slice(1).join(" ");
       // The password must not stay in the chat history.
       ctx.api
         .deleteMessage(ctx.chat!.id, ctx.message!.message_id)
         .catch(() => {});
+      if (!password) {
+        await replyRouted(ctx, "Использование: /unlock <пароль>");
+        return;
+      }
       if (now < attemptsBlockedUntil) {
         await replyRouted(
           ctx,
@@ -145,7 +176,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         return;
       }
       const hash = createHash("sha256").update(password, "utf-8").digest("hex");
-      if (password && hash === config.passwordHash) {
+      if (hash === config.passwordHash) {
         unlockedUntil = now + AUTOLOCK_MS;
         failedAttempts = 0;
         await replyRouted(
@@ -179,7 +210,17 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
           // stale callback
         }
       } else {
-        await replyRouted(ctx, "🔒 Бот заблокирован. /unlock <пароль>");
+        // While locked, any text may be a mistyped password — remove it;
+        // the bot would not process it anyway.
+        if (ctx.message?.text) {
+          ctx.api
+            .deleteMessage(ctx.chat!.id, ctx.message.message_id)
+            .catch(() => {});
+        }
+        await replyRouted(
+          ctx,
+          "🔒 Бот заблокирован, сообщение удалено. /unlock <пароль>"
+        );
       }
       return;
     }
