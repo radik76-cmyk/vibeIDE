@@ -84,6 +84,7 @@ function routeOf(ctx: Context): ThreadRoute {
 export async function createBot(config: Config, initialProjectPath?: string): Promise<Bot> {
   const bot = new Bot(config.telegramBotToken);
   const bridge = new Bridge(bot.api, initialProjectPath);
+  let rcEnabled = true;
 
   // Reply into the topic the update came from. A Markdown parse failure
   // falls back to plain text — losing the reply is worse than losing bold.
@@ -309,6 +310,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         "/settings — панель настроек вкладки (модель, скорость, режим)",
         "/lock, /unlock <code>&lt;пароль&gt;</code> — замок бота",
         "/mode <code>safe|fast</code> — подтверждать ли Bash/Write/Edit кнопками",
+        "/rc <code>[on|off]</code> — удалённое управление: мастер-выключатель обработки сообщений",
         "/restart — перезапустить бота",
         "/shutdown — выключить бота",
         "/stop — прервать текущую задачу и очистить очередь",
@@ -351,6 +353,27 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         ? "⏹ Останавливаю. Очередь очищена."
         : "Сейчас ничего не выполняется."
     );
+  });
+
+  // /rc — remote control master switch
+  bot.command("rc", async (ctx) => {
+    const arg = (ctx.match || "").trim().toLowerCase();
+    if (arg === "on" || arg === "1") {
+      rcEnabled = true;
+      await replyRouted(ctx, "📡 Удалённое управление <b>включено</b>.", { parse_mode: "HTML" });
+    } else if (arg === "off" || arg === "0") {
+      rcEnabled = false;
+      await replyRouted(ctx, "🔇 Удалённое управление <b>выключено</b>. Бот не обрабатывает сообщения.", { parse_mode: "HTML" });
+    } else {
+      rcEnabled = !rcEnabled;
+      await replyRouted(
+        ctx,
+        rcEnabled
+          ? "📡 Удалённое управление <b>включено</b>."
+          : "🔇 Удалённое управление <b>выключено</b>. Бот не обрабатывает сообщения.",
+        { parse_mode: "HTML" }
+      );
+    }
   });
 
   // /restart — exit with RESTART_CODE so the launcher loop starts us again.
@@ -1142,6 +1165,10 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
   // Handle documents — save into the inbox and hand the path to the agent
   bot.on("message:document", async (ctx) => {
+    if (!rcEnabled) {
+      await replyRouted(ctx, "🔇 Удалённое управление выключено. /rc — включить.");
+      return;
+    }
     const doc = ctx.message.document;
     let file;
     try {
@@ -1179,6 +1206,10 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
 
   // Handle photo messages (images)
   bot.on("message:photo", async (ctx) => {
+    if (!rcEnabled) {
+      await replyRouted(ctx, "🔇 Удалённое управление выключено. /rc — включить.");
+      return;
+    }
     const photo = ctx.message.photo;
     if (!photo || photo.length === 0) return;
 
@@ -1218,6 +1249,10 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
   bot.on("message:text", async (ctx) => {
     const text = ctx.message.text;
     if (!text || text.startsWith("/")) return; // Skip unhandled commands
+    if (!rcEnabled) {
+      await replyRouted(ctx, "🔇 Удалённое управление выключено. /rc — включить.");
+      return;
+    }
     await bridge.sendMessage(ctx.chat.id, text, extractRoute(ctx.message));
     await bridge.syncTopicTitle(ctx.chat.id, extractRoute(ctx.message));
   });
@@ -1233,6 +1268,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     { command: "model", description: "Модель: fable, opus, sonnet, haiku" },
     { command: "new", description: "Свежая сессия в этой вкладке" },
     { command: "projects", description: "Список проектов" },
+    { command: "rc", description: "Удалённое управление: on/off" },
     { command: "rename", description: "Переименовать сессию и вкладку" },
     { command: "restart", description: "Перезапустить бота" },
     { command: "resume", description: "Привязать сессию по id" },
