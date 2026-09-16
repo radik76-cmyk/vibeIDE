@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
-import { GrammyError, type Api, type RawApi } from "grammy";
+import { GrammyError, InputFile, type Api, type RawApi } from "grammy";
 import type { Message } from "grammy/types";
 
 // ---------------------------------------------------------------------------
@@ -100,6 +100,41 @@ export async function sendRouted(
     if (params === undefined) continue;
     try {
       const msg = await api.sendMessage(chatId, text, { ...extra, ...params });
+      if (kind !== "plain" || key === "main") {
+        workingKind.set(key, kind);
+      }
+      return msg;
+    } catch (err) {
+      if (!isTopicError(err)) throw err;
+      workingKind.delete(key);
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+export async function sendPhotoRouted(
+  api: Api<RawApi>,
+  chatId: number,
+  photo: Buffer,
+  route: ThreadRoute,
+  extra?: Record<string, unknown>
+): Promise<Message.PhotoMessage> {
+  const key = routeKey(route);
+  const cached = workingKind.get(key);
+  const kinds = cached
+    ? [cached, ...KIND_ORDER.filter((k) => k !== cached)]
+    : KIND_ORDER;
+
+  let lastErr: unknown;
+  for (const kind of kinds) {
+    const params = paramsFor(kind, route);
+    if (params === undefined) continue;
+    try {
+      const msg = await api.sendPhoto(chatId, new InputFile(photo, "table.png"), {
+        ...extra,
+        ...params,
+      });
       if (kind !== "plain" || key === "main") {
         workingKind.set(key, kind);
       }

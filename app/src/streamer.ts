@@ -1,5 +1,6 @@
 import type { Api, RawApi } from "grammy";
-import { sendRouted, type ThreadRoute } from "./topics.js";
+import { sendRouted, sendPhotoRouted, type ThreadRoute } from "./topics.js";
+import { renderTablePng } from "./table-image.js";
 
 const EDIT_INTERVAL_MS = 300;
 const MAX_MESSAGE_LENGTH = 3800; // Leave room for formatting overhead under 4096 limit
@@ -29,45 +30,16 @@ function isTableSeparator(line: string): boolean {
   return /^\|[\s:|-]+\|?\s*$/.test(line.trim());
 }
 
-/**
- * Render a Markdown table as vertical cards for mobile readability.
- *
- *   | Name | Status |       📦 Name
- *   |------|--------|  →      Status: OK
- *   | foo  | OK     |
- *
- * If the table has only 1-2 columns, render as a compact <pre> instead.
- */
-function renderTableCards(
-  headers: string[],
-  rows: string[][]
-): string {
-  // Narrow tables (1-2 cols) → simple pre block
-  if (headers.length <= 2) {
-    const lines = [headers.join(" | "), ...rows.map((r) => r.join(" | "))];
-    return "<pre>" + lines.map(escHtml).join("\n") + "</pre>";
-  }
+type Segment = { kind: "html"; html: string } | { kind: "image"; png: Buffer };
 
-  // Wide tables → vertical card per row
-  const cards: string[] = [];
-  for (const row of rows) {
-    const title = inlineFormat(row[0] ?? "");
-    const fields = headers
-      .slice(1)
-      .map((h, i) => {
-        const val = row[i + 1] ?? "";
-        return `  <b>${escHtml(h)}:</b> ${inlineFormat(val)}`;
-      })
-      .filter((f) => f.trim());
-    cards.push(`📦 ${title}\n${fields.join("\n")}`);
-  }
-  return cards.join("\n\n");
-}
+const TABLE_IMAGE_PLACEHOLDER = "\x00TABLE_IMAGE\x00";
 
-/** Convert Claude's Markdown output to Telegram-compatible HTML. */
-function mdToTgHtml(md: string): string {
+
+/** Convert Claude's Markdown output to mixed segments: HTML text + table images. */
+function mdToSegments(md: string): Segment[] {
   const lines = md.split("\n");
   const out: string[] = [];
+  const tableImages: Buffer[] = [];
   let inCode = false;
   let codeLang = "";
   let codeLines: string[] = [];
@@ -80,14 +52,22 @@ function mdToTgHtml(md: string): string {
       inTable = false;
       return;
     }
-    out.push(renderTableCards(tableHeaders, tableRows));
+    try {
+      const png = renderTablePng(tableHeaders, tableRows);
+      tableImages.push(png);
+      out.push(TABLE_IMAGE_PLACEHOLDER);
+    } catch (err) {
+      // Fallback to <pre> on render failure
+      console.error("Table image render failed:", err);
+      const pre = [tableHeaders.join(" | "), ...tableRows.map((r) => r.join(" | "))];
+      out.push("<pre>" + pre.map(escHtml).join("\n") + "</pre>");
+    }
     tableHeaders = [];
     tableRows = [];
     inTable = false;
   };
 
   for (const raw of lines) {
-    // Fenced code blocks: ```lang ... ```
     if (/^```/.test(raw)) {
       if (inTable) flushTable();
       if (!inCode) {
@@ -105,21 +85,17 @@ function mdToTgHtml(md: string): string {
       continue;
     }
 
-    // Markdown tables: lines starting/containing |
     const trimmed = raw.trim();
     if (trimmed.startsWith("|") || (inTable && trimmed.includes("|"))) {
       if (isTableSeparator(trimmed)) {
-        // separator confirms we're in a table; skip the line itself
         inTable = true;
         continue;
       }
       const cells = parseTableRow(trimmed);
       if (!inTable) {
-        // First row = headers
         inTable = true;
         tableHeaders = cells;
       } else if (tableHeaders.length === 0) {
-        // Header row not yet captured (no separator before data)
         tableHeaders = cells;
       } else {
         tableRows.push(cells);
@@ -128,30 +104,42 @@ function mdToTgHtml(md: string): string {
     }
     if (inTable) flushTable();
 
-    // Headings → bold
     const headingMatch = raw.match(/^(#{1,6})\s+(.*)/);
     if (headingMatch) {
       out.push("<b>" + inlineFormat(headingMatch[2]) + "</b>");
       continue;
     }
 
-    // Horizontal rules
     if (/^[-*_]{3,}\s*$/.test(raw)) {
       out.push("—");
       continue;
     }
 
-    // Regular line — apply inline formatting
     out.push(inlineFormat(raw));
   }
 
-  // Flush any unterminated blocks
   if (inCode) {
     out.push("<pre>" + escHtml(codeLines.join("\n")) + "</pre>");
   }
   if (inTable) flushTable();
 
-  return out.join("\n");
+  // Split combined output by placeholder into segments
+  const fullHtml = out.join("\n");
+  const parts = fullHtml.split(TABLE_IMAGE_PLACEHOLDER);
+  const segments: Segment[] = [];
+  let imgIdx = 0;
+
+  for (let i = 0; i < parts.length; i++) {
+    const html = parts[i].trim();
+    if (html) {
+      segments.push({ kind: "html", html });
+    }
+    if (i < parts.length - 1 && imgIdx < tableImages.length) {
+      segments.push({ kind: "image", png: tableImages[imgIdx++] });
+    }
+  }
+
+  return segments;
 }
 
 /** Apply inline Markdown formatting to a single line. */
@@ -288,62 +276,60 @@ export class Streamer {
   }
 
   /**
-   * Replace the streamed plain-text messages with HTML-formatted ones.
-   * Deletes the old messages and sends new ones with parse_mode: HTML.
+   * Replace the streamed plain-text messages with formatted ones:
+   * HTML text segments + PNG images for tables.
    */
   private async replaceWithFormatted(): Promise<void> {
-    // Collect all message ids to delete (earlier chunks + current).
     const toDelete = [...this.sentMessages];
     if (this.messageId) toDelete.push(this.messageId);
 
-    // Reconstruct the full text from all chunks.
-    // Note: earlier chunks already had their text sent as plain; we cannot
-    // recover that text easily, so we only format the current chunk.
-    // For multi-chunk messages, we delete the old and re-send formatted.
-
-    // Delete old plain messages.
     for (const id of toDelete) {
       try {
         await this.api.deleteMessage(this.chatId, id);
       } catch {
-        // already gone or no rights — proceed
+        // already gone or no rights
       }
     }
     this.sentMessages = [];
     this.messageId = null;
 
-    // Send the formatted version, split into Telegram-sized chunks.
-    const html = mdToTgHtml(this.fullText);
-    const chunks = splitChunks(html, MAX_MESSAGE_LENGTH);
+    const segments = mdToSegments(this.fullText);
 
-    for (const chunk of chunks) {
-      try {
-        const msg = await sendRouted(
-          this.api,
-          this.chatId,
-          chunk,
-          this.route,
-          { parse_mode: "HTML" }
-        );
-        this.messageId = msg.message_id;
-      } catch (htmlErr) {
-        // HTML failed — send plain fallback for the full text
-        console.error("HTML send failed, falling back to plain:", htmlErr);
+    for (const seg of segments) {
+      if (seg.kind === "image") {
         try {
-          const plainChunks = splitChunks(this.fullText, MAX_MESSAGE_LENGTH);
-          for (const pc of plainChunks) {
+          await sendPhotoRouted(this.api, this.chatId, seg.png, this.route);
+        } catch (err) {
+          console.error("Table image send failed:", err);
+        }
+        continue;
+      }
+
+      const chunks = splitChunks(seg.html, MAX_MESSAGE_LENGTH);
+      for (const chunk of chunks) {
+        try {
+          const msg = await sendRouted(
+            this.api,
+            this.chatId,
+            chunk,
+            this.route,
+            { parse_mode: "HTML" }
+          );
+          this.messageId = msg.message_id;
+        } catch (htmlErr) {
+          console.error("HTML send failed, falling back to plain:", htmlErr);
+          try {
             const msg = await sendRouted(
               this.api,
               this.chatId,
-              pc,
+              chunk.replace(/<[^>]+>/g, ""),
               this.route
             );
             this.messageId = msg.message_id;
+          } catch (e) {
+            console.error("Failed to send message:", e);
           }
-        } catch (e) {
-          console.error("Failed to send formatted message:", e);
         }
-        break;
       }
     }
   }
