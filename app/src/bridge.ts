@@ -8,6 +8,7 @@ import {
   sendRouted,
   type ThreadRoute,
 } from "./topics.js";
+import { usage } from "./usage.js";
 
 interface PendingMessage {
   chatId: number;
@@ -447,14 +448,28 @@ export class Bridge {
         }
 
         if (message.type === "result") {
-          const duration = (message as { duration_ms?: number }).duration_ms;
+          const r = message as any;
+          const duration = r.duration_ms as number | undefined;
           if (typeof duration === "number" && duration > 10_000) {
             const s = Math.round(duration / 1000);
             const t = s >= 60 ? `${Math.floor(s / 60)}м ${s % 60}с` : `${s}с`;
             await streamer.append(`\n\n⏱ ${t}`);
           }
+          usage.record(
+            {
+              costUsd: r.total_cost_usd ?? 0,
+              durationMs: r.duration_ms ?? 0,
+              durationApiMs: r.duration_api_ms ?? 0,
+              numTurns: r.num_turns ?? 0,
+              inputTokens: r.usage?.input_tokens ?? 0,
+              outputTokens: r.usage?.output_tokens ?? 0,
+              cacheReadTokens: r.usage?.cache_read_input_tokens ?? 0,
+              cacheCreationTokens: r.usage?.cache_creation_input_tokens ?? 0,
+            },
+            r.modelUsage
+          );
           if (message.is_error && "errors" in message) {
-            const errors = (message as any).errors as string[];
+            const errors = r.errors as string[];
             if (errors?.length) {
               await streamer.append(`\n\nError: ${errors.join("\n")}`);
             }

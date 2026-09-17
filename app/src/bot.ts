@@ -12,6 +12,7 @@ import {
   sendRouted,
   type ThreadRoute,
 } from "./topics.js";
+import { usage } from "./usage.js";
 import {
   baseName,
   listProjects,
@@ -311,6 +312,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         "/lock, /unlock <code>&lt;пароль&gt;</code> — замок бота",
         "/mode <code>safe|fast</code> — подтверждать ли Bash/Write/Edit кнопками",
         "/rc <code>[on|off]</code> — удалённое управление: мастер-выключатель обработки сообщений",
+        "/usage — статистика: стоимость, токены, запросы",
         "/restart — перезапустить бота",
         "/shutdown — выключить бота",
         "/stop — прервать текущую задачу и очистить очередь",
@@ -374,6 +376,11 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
         { parse_mode: "HTML" }
       );
     }
+  });
+
+  // /usage — cumulative usage stats since bot start
+  bot.command("usage", async (ctx) => {
+    await replyRouted(ctx, usage.format(), { parse_mode: "HTML" });
   });
 
   // /restart — exit with RESTART_CODE so the launcher loop starts us again.
@@ -1280,6 +1287,7 @@ export async function createBot(config: Config, initialProjectPath?: string): Pr
     { command: "stop", description: "Прервать текущую задачу" },
     { command: "switch", description: "Сменить проект вкладки" },
     { command: "unlock", description: "Разблокировать вкладку (пароль)" },
+    { command: "usage", description: "Статистика: стоимость, токены, запросы" },
   ]);
 
   // Confirm a /restart to the topic that requested it.
